@@ -154,6 +154,8 @@ pub enum FeatureFlag {
     /// If enabled, new single session is used by the VM to avoid squashing write-sets and cache
     /// reads between sessions (e.g., between transaction prologue, user session and epilogue).
     SESSION_CONTINUATION = 104,
+    /// Enables function value reflection in the stdlib
+    ENABLE_FUNCTION_REFLECTION = 105,
 }
 
 impl FeatureFlag {
@@ -258,6 +260,8 @@ impl FeatureFlag {
             FeatureFlag::ENABLE_TRUSTED_CODE,
             FeatureFlag::ENABLE_ENUM_OPTION,
             FeatureFlag::VM_BINARY_FORMAT_V9,
+            FeatureFlag::ENABLE_FRAMEWORK_FOR_OPTION,
+            FeatureFlag::ENABLE_FUNCTION_REFLECTION,
         ]
     }
 }
