@@ -959,6 +959,7 @@ dependencies = [
  "aptos-network",
  "aptos-peer-monitoring-service-types",
  "aptos-reliable-broadcast",
+ "aptos-resource-viewer",
  "aptos-runtimes",
  "aptos-safety-rules",
  "aptos-schemadb",
@@ -971,7 +972,6 @@ dependencies = [
  "aptos-types",
  "aptos-validator-transaction-pool",
  "aptos-vm",
- "aptos-vm-validator",
  "async-trait",
  "bcs 0.1.4",
  "byteorder",
@@ -3859,13 +3859,17 @@ name = "aptos-resource-viewer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aptos-logger",
  "aptos-types",
  "aptos-vm",
  "aptos-vm-environment",
+ "aptos-vm-logging",
  "move-binary-format",
  "move-bytecode-utils",
  "move-core-types",
  "move-resource-viewer",
+ "move-vm-runtime",
+ "move-vm-types",
 ]
 
 [[package]]
@@ -5051,6 +5055,7 @@ dependencies = [
  "aptos-executor-test-helpers",
  "aptos-gas-schedule",
  "aptos-logger",
+ "aptos-resource-viewer",
  "aptos-storage-interface",
  "aptos-temppath",
  "aptos-types",
