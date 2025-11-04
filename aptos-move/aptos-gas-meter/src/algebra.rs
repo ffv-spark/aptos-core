@@ -237,15 +237,21 @@ where
     ) -> PartialVMResult<()> {
         let amount = abstract_amount.evaluate(self.feature_version, &self.vm_gas_params);
 
-        let (actual, res) = self.charge(amount);
-        if self.feature_version >= 12 {
-            self.io_gas_used += actual;
-        }
-        res?;
+        match self.balance.checked_sub(amount) {
+            Some(new_balance) => {
+                self.balance = new_balance;
+                self.io_gas_used += amount;
+            },
+            None => {
+                let old_balance = self.balance;
+                self.balance = 0.into();
+                if self.feature_version >= 12 {
+                    self.io_gas_used += old_balance;
+                }
+                return Err(PartialVMError::new(StatusCode::OUT_OF_GAS));
+            },
+        };
 
-        if self.feature_version < 12 {
-            self.io_gas_used += amount;
-        }
         if self.feature_version >= 7 && self.io_gas_used > self.max_io_gas {
             Err(PartialVMError::new(StatusCode::IO_LIMIT_REACHED))
         } else {
