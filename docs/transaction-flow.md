@@ -107,6 +107,221 @@ core_mempool/mempool.rs:289-383 - add_txn()
 - **TimelineIndex**: 按时间线组织准备广播的交易
 - **TTLIndex**: 跟踪交易过期时间
 
+### 2.3 内存池容量管理和满载处理
+
+#### 容量配置
+
+**文件**: `config/src/config/mempool_config.rs:122-124`
+
+```rust
+pub struct MempoolConfig {
+    /// 最多容纳的交易数量
+    pub capacity: usize,                    // 默认: 2_000_000 (200 万笔)
+
+    /// 最多容纳的字节数
+    pub capacity_bytes: usize,              // 默认: 2 * 1024 * 1024 * 1024 (2 GB)
+
+    /// 每个用户最多容纳的序列号交易数
+    pub capacity_per_user: usize,           // 默认: 100
+
+    /// 每个用户最多容纳的无序交易数
+    pub orderless_txn_capacity_per_user: usize,  // 默认: 1000
+
+    ...
+}
+```
+
+**容量判断逻辑** (`mempool/src/core_mempool/transaction_store.rs:459-461`):
+
+```rust
+fn is_full(&self) -> bool {
+    self.system_ttl_index.size() >= self.capacity || self.size_bytes >= self.capacity_bytes
+}
+```
+
+**满足任意一个条件即视为满**：
+- 交易数量 ≥ 200 万笔，**或**
+- 总字节数 ≥ 2 GB
+
+**实际限制分析**：
+```
+假设平均每笔交易 300 bytes:
+  200 万笔 × 300 bytes = 600 MB << 2 GB
+
+结论: 通常交易数量先达到上限
+```
+
+#### 满载处理机制
+
+##### 1. 自动驱逐策略
+
+**文件**: `mempool/src/core_mempool/transaction_store.rs:416-456`
+
+```rust
+fn check_is_full_after_eviction(
+    &mut self,
+    txn: &MempoolTransaction,
+    account_sequence_number: Option<u64>,
+) -> bool {
+    if self.is_full() && self.check_txn_ready(txn, account_sequence_number) {
+        // 尝试从 ParkingLot 驱逐未就绪的交易
+        let mut evicted_txns = 0;
+        for txn in self.parking_lot_index.iter() {
+            if !self.check_txn_ready(&txn, ...) {
+                evicted_txns += 1;
+                self.index_remove(&txn);  // 驱逐交易
+                if !self.is_full() {
+                    break;  // 释放足够空间后停止
+                }
+            }
+        }
+    }
+    self.is_full()
+}
+```
+
+**驱逐规则**：
+1. **触发条件**：内存池满 **且** 有新的就绪交易要插入
+2. **驱逐目标**：优先驱逐 ParkingLot 中的**未就绪交易**（序列号不连续）
+3. **停止条件**：释放足够空间或 ParkingLot 为空
+
+**为什么驱逐未就绪交易**：
+- 就绪交易可以立即被共识层消费
+- 未就绪交易（序列号跳跃）可能长时间无法执行
+- 优先保留有价值的交易
+
+##### 2. 拒绝新交易
+
+**文件**: `mempool/src/core_mempool/transaction_store.rs:312-317`
+
+```rust
+if self.check_is_full_after_eviction(&txn, account_sequence_number) {
+    return MempoolStatus::new(MempoolStatusCode::MempoolIsFull).with_message(format!(
+        "Mempool is full. Mempool size: {}, Capacity: {}",
+        self.system_ttl_index.size(),
+        self.capacity,
+    ));
+}
+```
+
+**客户端体验**：
+- 收到 HTTP 响应码和错误消息
+- 状态码：`MempoolIsFull`
+- 需要客户端实现重试逻辑（指数退避）
+
+##### 3. 广播退避机制
+
+**文件**: `mempool/src/shared_mempool/tasks.rs:261-265`
+
+```rust
+for (_, (mempool_status, _)) in results.into_iter() {
+    if mempool_status.code == MempoolStatusCode::MempoolIsFull {
+        backoff_and_retry = true;
+        break;
+    }
+}
+
+// 返回给发送方
+MempoolSyncMsg::BroadcastTransactionsResponse {
+    message_id,
+    retry: backoff_and_retry,     // true: 请求重试
+    backoff: backoff_and_retry,   // true: 延长广播间隔
+}
+```
+
+**退避效果** (`config/src/config/mempool_config.rs:112-114`):
+- **正常间隔**：`shared_mempool_tick_interval_ms = 10ms`
+- **退避间隔**：`shared_mempool_backoff_interval_ms = 30_000ms` (30 秒)
+- **退避倍数**：3000 倍
+
+**网络保护**：
+- 防止向已满节点持续发送交易
+- 减少网络带宽浪费
+- 自动分流到其他节点
+
+##### 4. 定期垃圾回收
+
+**配置**: `system_transaction_gc_interval_ms: 60_000` (每 60 秒)
+
+**清理目标**：
+1. **过期交易**：TTL 超时（默认 600 秒）
+2. **已提交交易**：已在区块中确认
+3. **被拒绝交易**：共识层明确拒绝
+
+**文件**: `mempool/src/core_mempool/mempool.rs` (定期调用)
+
+```rust
+pub fn gc_by_expiration_time(&mut self, now: Duration) {
+    self.transactions.gc_by_expiration_time(now);
+}
+```
+
+#### 内存池会被塞满吗？
+
+##### 正常情况：不会
+
+**原因**：
+- **持续消费**：Mempool → Consensus → Block，每秒数千笔
+- **自动回收**：60 秒 GC 清理过期交易
+- **容量充足**：200 万笔远大于正常负载（~10 万笔）
+
+##### 异常情况：会满
+
+| 场景 | 原因 | 影响 |
+|------|------|------|
+| **共识停滞** | 验证者网络故障，无法生成新区块 | 交易堆积，无法消费 |
+| **拒绝服务攻击** | 大量低 gas 垃圾交易涌入 | 填满内存池 |
+| **网络拥堵** | 提交速度 >> 处理速度 | 队列持续增长 |
+| **配置错误** | 容量设置过小 | 快速达到上限 |
+
+##### 满载时的系统行为
+
+```
+内存池达到容量上限
+    ↓
+新的就绪交易到达
+    ↓
+尝试驱逐未就绪交易
+    ├─ 成功驱逐 → 接受新交易 ✓
+    └─ 无法驱逐 → 拒绝新交易 ✗
+        ↓
+    返回 MempoolIsFull 错误
+        ↓
+    客户端收到错误并重试
+        ↓
+    触发广播退避（30 秒）
+        ↓
+    减轻网络和内存池压力
+```
+
+#### 容量规划建议
+
+| 节点类型 | 推荐容量 | 理由 |
+|---------|---------|------|
+| **验证者** | 200 万笔 / 2 GB（默认） | 高吞吐量，需要大缓冲 |
+| **全节点** | 50-100 万笔 / 512 MB | 转发为主，不需要太大 |
+| **归档节点** | 100 万笔 / 1 GB | 提供历史查询，适中即可 |
+
+**监控指标**：
+- `aptos_core_mempool_txn_count`：当前交易数
+- `aptos_core_mempool_size_bytes`：当前字节数
+- `aptos_shared_mempool_transactions_processed{result="MempoolIsFull"}`：拒绝率
+
+**告警阈值**：
+- 交易数 > 150 万（75%）：警告
+- 交易数 > 180 万（90%）：严重
+- 拒绝率 > 1%：需要调查
+
+**关键文件路径**:
+- `config/src/config/mempool_config.rs:42-107` - 容量配置定义
+- `config/src/config/mempool_config.rs:109-175` - 默认值
+- `mempool/src/core_mempool/transaction_store.rs:312-317` - 满载拒绝逻辑
+- `mempool/src/core_mempool/transaction_store.rs:416-456` - 驱逐逻辑
+- `mempool/src/core_mempool/transaction_store.rs:459-461` - 容量判断
+- `mempool/src/shared_mempool/tasks.rs:261-279` - 退避响应
+
+---
+
 ### 2.4 交易广播机制（节点间复制）
 
 > **重要**：当一笔交易通过 RPC 提交到一个节点并保存到内存池后，**这笔交易会主动广播到其他已连接的节点**，确保整个网络的交易同步。
@@ -416,6 +631,484 @@ Quorum Store 是 Aptos 共识层的关键优化组件，**将交易传播与区�
 - 批次由验证者签名确认（ProofOfStore = 2f+1 签名）
 - 区块只包含批次的引用（几KB），而非完整交易（几MB）
 - 验证者从本地存储获取完整交易执行
+
+### 3.0 Quorum Store 链上配置与启用机制
+
+> **重要**：Quorum Store 的启用是**链上配置，全网统一**，不是单个节点独立决定的。
+
+#### 配置存储位置
+
+**文件**: `types/src/on_chain_config/consensus_config.rs:454-470`
+
+```rust
+impl OnChainConfig for OnChainConsensusConfig {
+    const MODULE_IDENTIFIER: &'static str = "consensus_config";
+    const TYPE_IDENTIFIER: &'static str = "ConsensusConfig";
+
+    /// The Move resource is stored at 0x1::consensus_config::ConsensusConfig
+    fn deserialize_into_config(bytes: &[u8]) -> Result<Self> {
+        let raw_bytes: Vec<u8> = bcs::from_bytes(bytes)?;
+        bcs::from_bytes(&raw_bytes)
+    }
+}
+```
+
+**链上路径**：`0x1::consensus_config::ConsensusConfig`
+
+#### 配置版本
+
+**文件**: `types/src/on_chain_config/consensus_config.rs:193-214`
+
+```rust
+pub enum OnChainConsensusConfig {
+    V1(ConsensusConfigV1),           // V1: 不支持 Quorum Store
+    V2(ConsensusConfigV1),           // V2: 强制启用 Quorum Store
+    V3 {                             // V3: 可配置
+        alg: ConsensusAlgorithmConfig,
+        vtxn: ValidatorTxnConfig,
+    },
+    V4 { ... },                      // V4: 增加 window_size
+    V5 { ... },                      // V5: 增加 rand_check_enabled
+}
+```
+
+#### 算法配置
+
+**文件**: `types/src/on_chain_config/consensus_config.rs:17-28`
+
+```rust
+pub enum ConsensusAlgorithmConfig {
+    Jolteon {
+        main: ConsensusConfigV1,
+        quorum_store_enabled: bool,     // ← Quorum Store 开关
+    },
+    DAG(DagConsensusConfigV1),          // DAG 共识（始终启用 QS）
+    JolteonV2 {
+        main: ConsensusConfigV1,
+        quorum_store_enabled: bool,     // ← Quorum Store 开关
+        order_vote_enabled: bool,
+    },
+}
+```
+
+#### 查询启用状态
+
+**文件**: `types/src/on_chain_config/consensus_config.rs:269-277`
+
+```rust
+pub fn quorum_store_enabled(&self) -> bool {
+    match &self {
+        OnChainConsensusConfig::V1(_config) => false,  // V1 不支持
+        OnChainConsensusConfig::V2(_) => true,         // V2 强制启用
+        OnChainConsensusConfig::V3 { alg, .. }
+        | OnChainConsensusConfig::V4 { alg, .. }
+        | OnChainConsensusConfig::V5 { alg, .. } => alg.quorum_store_enabled(),
+    }
+}
+```
+
+#### 配置更新流程
+
+```
+治理提案提交
+    ↓
+验证者投票（链上治理）
+    ↓
+提案通过
+    ↓
+配置写入链上 (0x1::consensus_config)
+    ↓
+Epoch 切换时生效
+    ↓
+所有节点读取新配置
+    ↓
+全网统一切换模式
+```
+
+**文件**: `mempool/src/shared_mempool/tasks.rs:762-795`
+
+```rust
+pub(crate) async fn process_config_update<V, P>(
+    config_update: OnChainConfigPayload<P>,
+    validator: Arc<RwLock<V>>,
+    broadcast_within_validator_network: Arc<RwLock<bool>>,
+) where
+    P: OnChainConfigProvider,
+{
+    // 读取链上共识配置
+    let consensus_config: anyhow::Result<OnChainConsensusConfig> = config_update.get();
+
+    match consensus_config {
+        Ok(consensus_config) => {
+            // 根据 Quorum Store 启用状态更新广播标志
+            *broadcast_within_validator_network.write() =
+                !consensus_config.quorum_store_enabled() && !consensus_config.is_dag_enabled()
+            //  ↑ 如果启用 QS，则 broadcast_within_validator_network = false
+        },
+        Err(e) => {
+            error!("Failed to read on-chain consensus config: {}", e);
+        },
+    }
+}
+```
+
+**应用逻辑** (`mempool/src/shared_mempool/tasks.rs:141-147`):
+
+```rust
+let ineligible_for_broadcast =
+    smp.network_interface.is_validator() && !smp.broadcast_within_validator_network();
+
+let timeline_state = if ineligible_for_broadcast {
+    TimelineState::NonQualified  // 不放入广播时间线
+} else {
+    TimelineState::NotReady      // 放入广播时间线
+};
+```
+
+#### 为什么必须全网统一？
+
+| 方面 | 原因 |
+|------|------|
+| **区块格式不兼容** | Quorum Store 模式区块包含 `ProofOfStore`<br/>Direct 模式包含完整交易 `Vec<SignedTransaction>` |
+| **网络协议不同** | QS 使用 `SignedBatchInfo` + `BatchRequest`<br/>Direct 使用 `BroadcastTransactionsRequest` |
+| **共识流程差异** | QS 需要验证 `ProofOfStore` 的 2f+1 签名<br/>Direct 直接验证交易 |
+| **状态同步不同** | QS 需要 `BatchStore` 缓存批次数据<br/>Direct 只需 `Mempool` |
+
+**如果节点独立决定会导致**：
+
+```
+节点 A (Quorum Store 模式)
+  |
+  | 发送 ProofOfStore
+  ↓
+节点 B (Direct Mempool 模式)
+  |
+  | ✗ 无法解析 ProofOfStore
+  | ✗ 期望完整交易
+  ↓
+共识无法达成
+网络分裂
+```
+
+#### Genesis 默认配置
+
+**文件**: `types/src/on_chain_config/consensus_config.rs:218-225`
+
+```rust
+pub fn default_for_genesis() -> Self {
+    OnChainConsensusConfig::V5 {
+        alg: ConsensusAlgorithmConfig::default_for_genesis(),
+        vtxn: ValidatorTxnConfig::default_for_genesis(),
+        window_size: DEFAULT_WINDOW_SIZE,
+        rand_check_enabled: true,
+    }
+}
+```
+
+**文件**: `types/src/on_chain_config/consensus_config.rs:31-36`
+
+```rust
+impl ConsensusAlgorithmConfig {
+    pub fn default_for_genesis() -> Self {
+        Self::JolteonV2 {
+            main: ConsensusConfigV1::default(),
+            quorum_store_enabled: true,  // ← 默认启用
+            order_vote_enabled: true,
+        }
+    }
+}
+```
+
+**新链默认配置**：Quorum Store **已启用**
+
+#### 节点本地配置（性能调优）
+
+节点**可以配置**的参数（但不影响是否启用 Quorum Store）：
+
+**文件**: `config/src/config/quorum_store_config.rs`
+
+```rust
+pub struct QuorumStoreConfig {
+    /// 批次生成间隔（毫秒）
+    pub batch_generation_interval_ms: u64,            // 默认: 100
+
+    /// 批次过期时间间隔（微秒）
+    pub batch_expiry_gap_when_init_usecs: u64,        // 默认: 60_000_000 (60秒)
+
+    /// 最大批次字节数
+    pub max_batch_bytes: usize,                       // 默认: 5_242_880 (5MB)
+
+    /// 批次请求超时（毫秒）
+    pub batch_request_timeout_ms: u64,                // 默认: 10_000
+
+    /// Mempool 拉取超时（毫秒）
+    pub mempool_txn_pull_timeout_ms: u64,             // 默认: 1_000
+
+    ...
+}
+```
+
+这些是**性能调优参数**，不改变 Quorum Store 的启用状态。
+
+**关键文件路径**:
+- `types/src/on_chain_config/consensus_config.rs:17-67` - 算法配置枚举
+- `types/src/on_chain_config/consensus_config.rs:193-277` - 版本配置和查询
+- `types/src/on_chain_config/consensus_config.rs:454-470` - 链上配置接口
+- `mempool/src/shared_mempool/tasks.rs:762-795` - 配置更新处理
+- `mempool/src/shared_mempool/tasks.rs:141-147` - 广播控制逻辑
+- `config/src/config/quorum_store_config.rs` - 本地性能调优配置
+
+---
+
+### 3.0.1 Quorum Store 与 Mempool 的协作关系
+
+> **核心要点**：Quorum Store 启用后，**Mempool 仍然完整工作**，只是角色从"主动推送"变为"被动响应拉取"。
+
+#### Mempool 的角色变化
+
+| 方面 | Direct Mempool 模式 | Quorum Store 模式 | 是否一致 |
+|------|-------------------|------------------|---------|
+| **接收 RPC 交易** | ✅ 客户端 → REST API → Mempool | ✅ 客户端 → REST API → Mempool | ✅ 一致 |
+| **交易存储** | ✅ TransactionStore | ✅ TransactionStore | ✅ 一致 |
+| **VM 验证** | ✅ 并行验证 | ✅ 并行验证 | ✅ 一致 |
+| **序列号管理** | ✅ ParkingLot + Ready | ✅ ParkingLot + Ready | ✅ 一致 |
+| **索引维护** | ✅ Priority/Timeline/TTL | ✅ Priority/Timeline/TTL | ✅ 一致 |
+| **垃圾回收** | ✅ 60秒定期 GC | ✅ 60秒定期 GC | ✅ 一致 |
+| **容量限制** | ✅ 200万笔/2GB | ✅ 200万笔/2GB | ✅ 一致 |
+| **网络广播** | ✅ 主动推送给验证者 | ❌ 不广播 | ❌ **唯一区别** |
+| **提供交易接口** | ✅ `GetBatchRequest` | ✅ `GetBatchRequest` | ✅ 一致（接口相同） |
+
+#### 完整架构图
+
+```
+┌────────────────────────────────────────────────────────────┐
+│ 客户端层                                                     │
+│                                                            │
+│ POST /v1/transactions                                      │
+└────────────────────────────────────────────────────────────┘
+                          ↓
+┌────────────────────────────────────────────────────────────┐
+│ REST API 层 (api/src/transactions.rs)                      │
+│                                                            │
+│ submit_transaction() → context.submit_transaction()        │
+└────────────────────────────────────────────────────────────┘
+                          ↓
+              MempoolClientRequest::SubmitTransaction
+                          ↓
+┌────────────────────────────────────────────────────────────┐
+│ Mempool 层 (完全正常工作，不论 QS 是否启用)                  │
+│                                                            │
+│ Coordinator 事件循环 (coordinator.rs:107-130)               │
+│   ├─ client_events         → handle_client_request()       │
+│   ├─ quorum_store_requests → process_quorum_store_request()│ ← 新增
+│   └─ scheduled_broadcasts  → execute_broadcast()           │ ← QS 时跳过验证者
+│                                                            │
+│ CoreMempool (mempool.rs)                                   │
+│   ├─ 接收交易: add_txn()                                    │
+│   ├─ VM 验证: validate_transaction()                       │
+│   ├─ 存储: TransactionStore                                │
+│   │   ├─ PriorityIndex: gas 价格排序                       │
+│   │   ├─ ParkingLot: 未就绪交易                            │
+│   │   ├─ TimelineIndex: 广播时间线                         │
+│   │   └─ TTLIndex: 过期管理                                │
+│   ├─ 提供交易: get_batch(max_txns, max_bytes, ...)        │ ← 两种模式都用
+│   └─ 垃圾回收: gc_by_expiration_time()                     │
+│                                                            │
+│ 容量: 200万笔 / 2GB                                         │
+└────────────────────────────────────────────────────────────┘
+         |                                    ↑
+         |                                    |
+         | Direct 模式:                        | Quorum Store 模式:
+         | 主动广播                            | 被动响应拉取
+         |                                    |
+         ↓                                    |
+  ┌──────────────┐                  ┌─────────────────────┐
+  │ 其他节点      │                  │ QuorumStoreRequest  │
+  │ Mempool      │                  │ ::GetBatchRequest   │
+  │              │                  │                     │
+  │ 接收广播交易   │                  │ MempoolProxy        │
+  └──────────────┘                  │ .pull_internal()    │
+                                    └─────────────────────┘
+                                              ↓
+                             ┌────────────────────────────────────┐
+                             │ Quorum Store 层                     │
+                             │                                    │
+                             │ BatchGenerator (定时拉取，每100ms)   │
+                             │   ↓                                │
+                             │ 从 Mempool 拉取 5000 笔交易          │
+                             │   ↓                                │
+                             │ 计算 BatchInfo + 签名                │
+                             │   ↓                                │
+                             │ 广播 SignedBatchInfo 到其他验证者     │
+                             │   ↓                                │
+                             │ BatchStore (批次缓存)                │
+                             │   ├─ 存储完整批次                   │
+                             │   └─ 容量: 10-50GB                 │
+                             │   ↓                                │
+                             │ ProofCoordinator (签名聚合)          │
+                             │   ├─ 收集 2f+1 签名                 │
+                             │   └─ 创建 ProofOfStore              │
+                             │   ↓                                │
+                             │ ProofManager (证明管理)              │
+                             │   └─ 维护 ProofOfStore 队列         │
+                             └────────────────────────────────────┘
+                                              ↓
+                                    区块提议者拉取 ProofOfStore
+                                              ↓
+                                    验证者从 BatchStore 获取完整交易
+                                              ↓
+                                    执行 (所有验证者)
+```
+
+#### Quorum Store 从 Mempool 拉取交易
+
+**文件**: `consensus/src/quorum_store/utils.rs:110-147`
+
+```rust
+pub struct MempoolProxy {
+    mempool_tx: Sender<QuorumStoreRequest>,
+    mempool_txn_pull_timeout_ms: u64,
+}
+
+impl MempoolProxy {
+    pub async fn pull_internal(
+        &self,
+        max_items: u64,
+        max_bytes: u64,
+        exclude_transactions: BTreeMap<TransactionSummary, TransactionInProgress>,
+    ) -> Result<Vec<SignedTransaction>, anyhow::Error> {
+        let (callback, callback_rcv) = oneshot::channel();
+
+        // 构造请求消息
+        let msg = QuorumStoreRequest::GetBatchRequest(
+            max_items,
+            max_bytes,
+            true,
+            exclude_transactions,
+            callback,
+        );
+
+        // 发送到 Mempool
+        self.mempool_tx.clone().try_send(msg)?;
+
+        // 等待响应（超时: 1000ms）
+        match timeout(Duration::from_millis(self.mempool_txn_pull_timeout_ms), callback_rcv).await {
+            Ok(resp) => match resp?? {
+                QuorumStoreResponse::GetBatchResponse(txns) => Ok(txns),
+                _ => Err(anyhow!("Unexpected response")),
+            },
+            Err(_) => Err(anyhow!("Timeout waiting for mempool")),
+        }
+    }
+}
+```
+
+#### Mempool 响应拉取请求
+
+**文件**: `mempool/src/shared_mempool/tasks.rs:631-684`
+
+```rust
+pub(crate) fn process_quorum_store_request<NetworkClient, TransactionValidator>(
+    smp: &SharedMempool<NetworkClient, TransactionValidator>,
+    req: QuorumStoreRequest,
+) {
+    match req {
+        QuorumStoreRequest::GetBatchRequest(
+            max_txns,
+            max_bytes,
+            return_non_full,
+            exclude_transactions,
+            callback,
+        ) => {
+            let txns;
+            {
+                let mut mempool = smp.mempool.lock();
+
+                // 垃圾回收（防止过期交易被拉取）
+                let curr_time = aptos_infallible::duration_since_epoch();
+                mempool.gc_by_expiration_time(curr_time);
+
+                // 从 Mempool 获取交易批次（和 Direct 模式使用相同的方法）
+                txns = mempool.get_batch(
+                    max_txns,         // 最多 5000 笔
+                    max_bytes,        // 最多 5MB
+                    return_non_full,  // true
+                    exclude_transactions  // 已在 BatchStore 中的交易
+                );
+            }
+
+            // 返回交易给 BatchGenerator
+            callback.send(Ok(QuorumStoreResponse::GetBatchResponse(txns)))
+        },
+        ...
+    }
+}
+```
+
+**关键点**：
+- 使用**相同的** `mempool.get_batch()` 方法
+- 按 **gas 价格优先级** 选择交易
+- 自动**排除**已在其他批次中的交易
+
+#### 职责分离设计
+
+| 组件 | 职责 | 数据结构 | 容量 |
+|------|------|---------|------|
+| **Mempool** | 交易存储和管理<br/>单节点视图 | TransactionStore<br/>200万笔 / 2GB | 主存储 |
+| **Quorum Store** | 交易传播和共识集成<br/>多节点协调 | BatchGenerator<br/>ProofCoordinator | 协调层 |
+| **BatchStore** | 批次缓存和分发<br/>网络优化 | LRU Cache + DB<br/>10-50 GB | 二级缓存 |
+
+#### 性能影响对比
+
+| 操作 | Direct 模式负载 | Quorum Store 模式负载 | 变化 |
+|------|---------------|---------------------|------|
+| 写入交易 | 高 | 高 | 无变化 |
+| 主动广播 | 高（每 50ms × N 节点） | **无** | ⬇️ 大幅减少 |
+| 响应拉取 | 低（偶尔） | 低（每 100ms） | 略微增加 |
+| 垃圾回收 | 中（每 60s） | 中（每 60s） | 无变化 |
+| 网络 I/O | 高 | 低 | ⬇️ 减少 70% |
+| **总体负载** | 高 | **中低** | ⬇️ 降低约 40% |
+
+**为什么负载降低**：
+- 不再主动推送交易给多个验证者
+- 批量拉取（5000 笔/次）比频繁推送（300 笔/次）更高效
+- 网络 I/O 压力转移到 Quorum Store 层
+
+#### 为什么不是"另外一套机制"？
+
+**设计原则：代码复用和向后兼容**
+
+1. **Mempool 核心逻辑完全不变**
+   - 存储、验证、索引、GC 逻辑保持一致
+   - 只是关闭了一个分支（验证者间广播）
+
+2. **接口兼容**
+   - `get_batch()` 方法被两种模式共用
+   - Quorum Store 只是一个新的调用者
+
+3. **灵活切换**
+   - 通过链上配置动态切换
+   - 不需要修改 Mempool 代码
+
+4. **清晰边界**
+   - Mempool: 存储
+   - Quorum Store: 传播
+   - 职责分离，各司其职
+
+**如果真的"另外一套机制"，会导致**：
+- 代码重复（两套存储、验证逻辑）
+- 数据不一致（同步问题）
+- 维护成本翻倍（两套系统）
+- 切换困难（需要数据迁移）
+
+**关键文件路径**:
+- `mempool/src/shared_mempool/coordinator.rs:107-130` - 主事件循环（两种模式共用）
+- `mempool/src/shared_mempool/tasks.rs:631-711` - 响应 QS 拉取请求
+- `mempool/src/core_mempool/mempool.rs:426-550` - get_batch() 方法（两种模式共用）
+- `consensus/src/quorum_store/batch_generator.rs:60-121` - BatchGenerator 定义
+- `consensus/src/quorum_store/utils.rs:97-148` - MempoolProxy 拉取接口
+
+---
 
 ### 3.1 核心数据结构
 
