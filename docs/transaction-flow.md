@@ -878,6 +878,237 @@ pub struct QuorumStoreConfig {
 | **网络广播** | ✅ 主动推送给验证者 | ❌ 不广播 | ❌ **唯一区别** |
 | **提供交易接口** | ✅ `GetBatchRequest` | ✅ `GetBatchRequest` | ✅ 一致（接口相同） |
 
+#### Mempool 工作流程对比图
+
+> **核心理念**：Quorum Store 不是替代 Mempool，而是在 Mempool 之上增加了一个批处理和传播层。Mempool 在两种模式下都保持完整运行。
+
+**流程图 1：Direct Mempool 模式下的 Mempool 工作流程**
+
+```
+客户端                        Mempool (验证者 A)                    其他验证者 (B/C/D)                共识层
+  |                                 |                                      |                         |
+  | 1. POST /v1/transactions        |                                      |                         |
+  |─────────────────────────────────>|                                      |                         |
+  |                                 |                                      |                         |
+  |                                 | 2. VM 验证                            |                         |
+  |                                 |    validate_transaction()            |                         |
+  |                                 |    (aptos-vm/src/aptos_vm.rs:1576)   |                         |
+  |                                 |                                      |                         |
+  |                                 | 3. 存储到 TransactionStore            |                         |
+  |                                 |    add_txn()                         |                         |
+  |                                 |    (transaction_store.rs:235)        |                         |
+  |                                 |    ├─ PriorityIndex (gas 排序)       |                         |
+  |                                 |    ├─ ParkingLot (未就绪)            |                         |
+  |                                 |    ├─ TimelineIndex (广播队列) ✅     |                         |
+  |                                 |    └─ TTLIndex (过期管理)            |                         |
+  |                                 |                                      |                         |
+  | 200 OK                          |                                      |                         |
+  |<─────────────────────────────────|                                      |                         |
+  |                                 |                                      |                         |
+  |                                 | [定时器触发，每 50ms]                 |                         |
+  |                                 | 4. execute_broadcast()               |                         |
+  |                                 |    (tasks.rs:57)                     |                         |
+  |                                 |    ↓                                 |                         |
+  |                                 | 5. determine_broadcast_batch()       |                         |
+  |                                 |    从 TimelineIndex 读取交易          |                         |
+  |                                 |    (network.rs:367)                  |                         |
+  |                                 |                                      |                         |
+  |                                 |─── BroadcastTransactionsRequest ──────>| 6. 接收广播              |
+  |                                 |     (完整交易，1-5 MB)                | 7. VM 验证               |
+  |                                 |                                      | 8. add_txn()            |
+  |                                 |                                      |    存储到本地 Mempool     |
+  |                                 |<── BroadcastTransactionsResponse ─────|                         |
+  |                                 |     (ACK 确认)                        |                         |
+  |                                 |                                      |                         |
+  |                                 | Mempool 持续运行                      | Mempool 持续运行         |
+  |                                 | ├─ 60秒定期 GC                        | ├─ 60秒定期 GC           |
+  |                                 | ├─ 容量管理 (2M/2GB)                  | ├─ 容量管理              |
+  |                                 | └─ 索引维护                           | └─ 索引维护              |
+  |                                 |                                      |                         |
+  |                                 |                                      |                         | [提议者轮次]
+  |                                 |                                      |                         | 9. 拉取交易
+  |                                 |<─────────────────────────────────────────────────────────────────|
+  |                                 |                                      |                         | GetBatchRequest
+  |                                 | 10. get_batch()                      |                         |
+  |                                 |     (mempool.rs:426)                 |                         |
+  |                                 |     从 PriorityIndex 选择交易         |                         |
+  |                                 |─────────────────────────────────────────────────────────────────>| 11. 返回交易
+  |                                 |                                      |                         |     创建区块
+  |                                 |                                      |                         |
+
+特点：
+✅ Mempool 完整运行（接收、验证、存储、索引、GC）
+✅ Mempool 主动广播交易到其他验证者
+✅ 共识层直接从 Mempool 拉取交易创建区块
+✅ 交易在所有节点的 Mempool 中都有副本
+```
+
+**流程图 2：Quorum Store 模式下的 Mempool 工作流程**
+
+```
+客户端                        Mempool (验证者 A)                    Quorum Store 层              其他验证者 (B/C/D)         共识层
+  |                                 |                                      |                            |                  |
+  | 1. POST /v1/transactions        |                                      |                            |                  |
+  |─────────────────────────────────>|                                      |                            |                  |
+  |                                 |                                      |                            |                  |
+  |                                 | 2. VM 验证                            |                            |                  |
+  |                                 |    validate_transaction()            |                            |                  |
+  |                                 |    (aptos-vm/src/aptos_vm.rs:1576)   |                            |                  |
+  |                                 |                                      |                            |                  |
+  |                                 | 3. 存储到 TransactionStore            |                            |                  |
+  |                                 |    add_txn()                         |                            |                  |
+  |                                 |    (transaction_store.rs:235)        |                            |                  |
+  |                                 |    ├─ PriorityIndex (gas 排序)       |                            |                  |
+  |                                 |    ├─ ParkingLot (未就绪)            |                            |                  |
+  |                                 |    ├─ TimelineIndex (NonQualified) ❌|                            |                  |
+  |                                 |    └─ TTLIndex (过期管理)            |                            |                  |
+  |                                 |                                      |                            |                  |
+  | 200 OK                          |                                      |                            |                  |
+  |<─────────────────────────────────|                                      |                            |                  |
+  |                                 |                                      |                            |                  |
+  |                                 | 注意：不向其他验证者广播交易           |                            |                  |
+  |                                 |                                      |                            |                  |
+  |                                 |                                      | [BatchGenerator 定时，100ms]                 |
+  |                                 |<─────────────────────────────────────| 4. MempoolProxy::pull_internal()            |
+  |                                 |                                      |    QuorumStoreRequest::GetBatchRequest      |
+  |                                 |                                      |    (utils.rs:110)          |                  |
+  |                                 | 5. process_quorum_store_request()    |                            |                  |
+  |                                 |    (tasks.rs:631)                    |                            |                  |
+  |                                 |    ↓                                 |                            |                  |
+  |                                 | 6. get_batch()                       |                            |                  |
+  |                                 |    (mempool.rs:426)                  |                            |                  |
+  |                                 |    从 PriorityIndex 选择交易          |                            |                  |
+  |                                 |    最多 5000 笔                       |                            |                  |
+  |                                 |─────────────────────────────────────>| 7. 返回交易                 |                  |
+  |                                 |                                      |    QuorumStoreResponse     |                  |
+  |                                 |                                      |    ::GetBatchResponse      |                  |
+  |                                 |                                      |                            |                  |
+  |                                 |                                      | 8. 创建批次                 |                  |
+  |                                 |                                      |    BatchInfo + 签名         |                  |
+  |                                 |                                      |    (batch_generator.rs:123)|                  |
+  |                                 |                                      |                            |                  |
+  |                                 |                                      |─── broadcast SignedBatchInfo ────>| 9. 接收元数据 |
+  |                                 |                                      |     (300 bytes)            | 10. 请求完整交易  |
+  |                                 |                                      |<── request_batch ──────────|                  |
+  |                                 |                                      |─── BatchResponse (1.5 MB) ─>| 11. 存储到     |
+  |                                 |                                      |                            |     BatchStore |
+  |                                 |                                      |                            |                  |
+  |                                 | Mempool 持续运行                      | Quorum Store 处理批次       | Mempool 持续运行  |
+  |                                 | ├─ 60秒定期 GC                        | ├─ 签名聚合                 | ├─ 60秒 GC       |
+  |                                 | ├─ 容量管理 (2M/2GB)                  | ├─ ProofOfStore 创建        | ├─ 容量管理      |
+  |                                 | └─ 索引维护                           | └─ 证明队列管理              | └─ 索引维护      |
+  |                                 |                                      |                            |                  |
+  |                                 |                                      |                            |                  | [提议者轮次]
+  |                                 |                                      |<───────────────────────────────────────────────| 12. 拉取证明
+  |                                 |                                      |                            |                  | pull_payload()
+  |                                 |                                      | 13. 返回 ProofOfStore       |                  |
+  |                                 |                                      |─────────────────────────────────────────────>| 14. 创建区块
+  |                                 |                                      |                            |                  |     (包含 ProofOfStore)
+  |                                 |                                      |                            |                  |
+
+特点：
+✅ Mempool 完整运行（接收、验证、存储、索引、GC）
+❌ Mempool 不向验证者广播交易
+✅ Quorum Store 从 Mempool 拉取交易进行批处理
+✅ Quorum Store 是 Mempool 的"消费者"，补充传播功能
+✅ 共识层从 Quorum Store 拉取 ProofOfStore 创建区块
+✅ Mempool 仍然是交易的唯一存储源
+```
+
+#### 关键设计理念：补充而非替代
+
+**为什么是"补充"？**
+
+1. **Mempool 核心功能保持不变**
+   - 接收交易：`handle_client_request()` ✅
+   - VM 验证：`validate_transaction()` ✅
+   - 存储管理：`TransactionStore` ✅
+   - 索引维护：`PriorityIndex`, `ParkingLot`, `TTLIndex` ✅
+   - 垃圾回收：`gc_by_expiration_time()` ✅
+   - 容量管理：2M 笔 / 2GB ✅
+
+2. **Quorum Store 只是新增了一个调用路径**
+   ```
+   Direct 模式：
+   Mempool.get_batch() ← ProposalGenerator (共识层直接调用)
+
+   Quorum Store 模式：
+   Mempool.get_batch() ← MempoolProxy ← BatchGenerator ← ProposalGenerator
+                         (增加中间层)
+   ```
+
+3. **同一个方法，不同调用者**
+   ```rust
+   // mempool/src/core_mempool/mempool.rs:426-550
+   pub fn get_batch(
+       &mut self,
+       max_txns: u64,
+       max_bytes: u64,
+       return_non_full: bool,
+       exclude_transactions: BTreeMap<TransactionSummary, TransactionInProgress>,
+   ) -> Vec<SignedTransaction> {
+       // 相同的实现
+       // Direct 模式：ProposalGenerator 直接调用
+       // QS 模式：BatchGenerator 通过 MempoolProxy 调用
+   }
+   ```
+
+4. **职责分离**
+   | 组件 | 职责 | 数据源 |
+   |------|------|--------|
+   | **Mempool** | 交易存储、验证、索引管理 | 客户端 RPC 提交 |
+   | **Quorum Store** | 批次处理、签名聚合、网络传播优化 | 从 Mempool 拉取 |
+   | **Consensus** | 区块生成、共识投票 | Direct: 从 Mempool 拉取<br/>QS: 从 Quorum Store 拉取 |
+
+5. **分层架构**
+   ```
+   Direct Mempool 模式：
+   ┌──────────┐
+   │ Consensus│
+   └────┬─────┘
+        │ get_batch()
+        ↓
+   ┌──────────┐
+   │ Mempool  │ ← 直接连接
+   └──────────┘
+
+   Quorum Store 模式：
+   ┌──────────┐
+   │ Consensus│
+   └────┬─────┘
+        │ pull_payload()
+        ↓
+   ┌────────────┐
+   │Quorum Store│ ← 新增层（批处理 + 传播优化）
+   └────┬───────┘
+        │ get_batch()
+        ↓
+   ┌──────────┐
+   │ Mempool  │ ← 底层不变
+   └──────────┘
+   ```
+
+**如果 Quorum Store "替代" Mempool 会怎样？**
+
+❌ **错误设计**：
+```
+- 需要重新实现交易存储逻辑（代码重复）
+- 需要重新实现 VM 验证逻辑（复杂度翻倍）
+- 需要重新实现序列号管理（ParkingLot 逻辑）
+- 需要重新实现容量管理和 GC（维护成本高）
+- 需要数据迁移机制（切换困难）
+- 两套系统需要保持一致（同步问题）
+```
+
+✅ **正确设计（当前实现）**：
+```
+- Mempool 保持原有功能（代码复用）
+- Quorum Store 仅负责批处理和传播（职责单一）
+- 通过链上配置动态切换（零数据迁移）
+- 使用相同的 get_batch() 接口（接口兼容）
+- Mempool 作为唯一数据源（数据一致性）
+```
+
 #### 完整架构图
 
 ```
