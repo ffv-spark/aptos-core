@@ -1110,6 +1110,411 @@ pub(crate) fn process_quorum_store_request<NetworkClient, TransactionValidator>(
 
 ---
 
+### 3.0.2 详细流程对比：Direct Mempool 模式 vs Quorum Store 模式
+
+> 本节提供两种模式从客户端提交交易到区块提议的完整端到端流程对比。
+
+#### Direct Mempool 模式完整流程图
+
+**适用场景**：Quorum Store 未启用时的传统模式
+
+```
+客户端                     验证者 A                    验证者 B                    验证者 C
+  |                           |                           |                           |
+  | POST /v1/transactions     |                           |                           |
+  |-------------------------->|                           |                           |
+  |                           | 1. REST API 接收          |                           |
+  |                           |    (api/src/transactions.rs:176)                      |
+  |                           |                           |                           |
+  |                           | 2. 转发到 Mempool         |                           |
+  |                           |    MempoolClientRequest::SubmitTransaction            |
+  |                           |    (shared_mempool/coordinator.rs:107)                |
+  |                           |                           |                           |
+  |                           | 3. VM 验证                |                           |
+  |                           |    validate_transaction() |                           |
+  |                           |    (aptos-vm/src/aptos_vm.rs:1576)                    |
+  |                           |                           |                           |
+  |                           | 4. 存储到 TransactionStore|                           |
+  |                           |    add_txn()              |                           |
+  |                           |    (core_mempool/transaction_store.rs:235)            |
+  |                           |    ├─ PriorityIndex: gas 排序                         |
+  |                           |    ├─ ParkingLot: 未就绪交易                          |
+  |                           |    ├─ TimelineIndex: 广播时间线 ← 加入广播队列          |
+  |                           |    └─ TTLIndex: 过期管理  |                           |
+  |                           |                           |                           |
+  | 200 OK (hash)             |                           |                           |
+  |<--------------------------|                           |                           |
+  |                           |                           |                           |
+  |                           | [定时触发，每 50ms]        |                           |
+  |                           | 5. execute_broadcast()    |                           |
+  |                           |    (shared_mempool/tasks.rs:57)                       |
+  |                           |    ↓                      |                           |
+  |                           | 6. determine_broadcast_batch()                        |
+  |                           |    (shared_mempool/network.rs:367)                    |
+  |                           |    ├─ 读取 TimelineIndex  |                           |
+  |                           |    └─ 最多 300 笔交易     |                           |
+  |                           |                           |                           |
+  |                           |--- BroadcastTransactionsRequest (完整交易，1-5 MB) -->|
+  |                           |                           | 7. 接收广播消息            |
+  |                           |                           |    (coordinator.rs:352)   |
+  |                           |                           | 8. VM 验证                |
+  |                           |                           | 9. add_txn() 到本地 Mempool|
+  |                           |                           |                           |
+  |                           |<-- BroadcastTransactionsResponse (ACK) --------------|
+  |                           | 10. process_broadcast_ack()|                           |
+  |                           |     移除 sent_messages    |                           |
+  |                           |                           |                           |
+  |                           |--- BroadcastTransactionsRequest (完整交易，1-5 MB) ----------------------->| 11. 接收广播
+  |                           |                           |                           | 12. VM 验证
+  |                           |                           |                           | 13. add_txn()
+  |                           |<-- BroadcastTransactionsResponse (ACK) --------------------------------| 14. 发送 ACK
+  |                           |                           |                           |
+  |                           |                           | [节点 B 也广播给 A 和 C]   |
+  |                           |                           |--- BroadcastTransactionsRequest (1-5 MB) ->| 15. 接收
+  |                           |<-- BroadcastTransactionsRequest (1-5 MB) -------------|                 | 16. 验证
+  |                           | 17. 接收、验证、存储       |                           | 17. add_txn() |
+  |                           |--- ACK ------------------>|                           |               |
+  |                           |                           |<-- ACK ---------------------------------| 18. ACK
+  |                           |                           |                           |
+  |                           | [节点 C 也广播给 A 和 B]   |                           |
+  |                           |<-- BroadcastTransactionsRequest (1-5 MB) -----------------------------|
+  |                           | 19. 接收、验证、存储       |<-- BroadcastTransactionsRequest (1-5 MB) -|
+  |                           |--- ACK ------------------------------------------------>|
+  |                           |                           |--- ACK ------------------>|
+  |                           |                           |                           |
+  |                           | 结果: 所有节点 Mempool 都有完整交易副本                 |
+  |                           |                           |                           |
+  |                           | [验证者 B 成为提议者]      |                           |
+  |                           |                           | 20. on_new_round()        |
+  |                           |                           |     (round_manager.rs:387)|
+  |                           |                           | 21. generate_proposal()   |
+  |                           |                           |     (proposal_generator.rs:497)
+  |                           |                           |     ↓                     |
+  |                           |                           | 22. MempoolClient::pull_payload()
+  |                           |                           |     ↓                     |
+  |                           |                           | 23. mempool.get_batch()   |
+  |                           |                           |     (core_mempool/mempool.rs:426)
+  |                           |                           |     ├─ 按 gas 价格选择     |
+  |                           |                           |     └─ 最多 5MB 交易       |
+  |                           |                           |     ↓                     |
+  |                           |                           | 24. 构建 BlockData        |
+  |                           |                           |     payload: DirectMempool(txns)
+  |                           |                           |     大小: 约 5 MB         |
+  |                           |                           |     ↓                     |
+  |                           |                           | 25. 签名并广播区块提议      |
+  |                           |                           |                           |
+  |                           |<-- broadcast Proposal (5 MB) -------|                 |
+  |                           | 26. 接收区块提议           |                           |
+  |                           | 27. 执行交易（本地 Mempool）|                           |
+  |                           | 28. 对执行结果投票         |                           |
+  |                           |                           |                           |<-- Proposal (5 MB)
+  |                           |                           |                           | 29. 接收提议
+  |                           |                           |                           | 30. 执行交易
+  |                           |                           |                           | 31. 投票
+  |                           |                           |                           |
+  |                           | 所有验证者完成执行和投票    |                           |
+```
+
+**Direct Mempool 模式特点**：
+- ✅ **简单直接**：交易直接广播，无需额外协调
+- ❌ **网络开销大**：每笔交易在网络中传输 N 次（N = 验证者数量）
+- ❌ **带宽密集**：频繁广播完整交易（每 50ms × 所有节点对）
+- ✅ **延迟低**：交易快速传播到所有节点
+- ❌ **扩展性差**：验证者数量增加时，网络负载呈平方增长
+
+**网络开销计算**（100 个验证者，1000 TPS）：
+```
+每秒交易数据: 1000 txns × 500 bytes/txn = 500 KB
+每个节点广播给其他 99 个节点: 500 KB × 99 = 49.5 MB/s
+所有节点总带宽: 49.5 MB/s × 100 = 4.95 GB/s（仅交易传播！）
+区块提议额外带宽: 5 MB × 3 次/秒 × 100 节点 = 1.5 GB/s
+总带宽需求: ~6.5 GB/s
+```
+
+---
+
+#### Quorum Store 模式完整流程图
+
+**适用场景**：Quorum Store 启用后的优化模式
+
+```
+客户端                     验证者 A                    验证者 B                    验证者 C
+  |                           |                           |                           |
+  | POST /v1/transactions     |                           |                           |
+  |-------------------------->|                           |                           |
+  |                           | 1. REST API 接收          |                           |
+  |                           |    (api/src/transactions.rs:176)                      |
+  |                           |                           |                           |
+  |                           | 2. 转发到 Mempool         |                           |
+  |                           |    MempoolClientRequest::SubmitTransaction            |
+  |                           |                           |                           |
+  |                           | 3. VM 验证                |                           |
+  |                           | 4. 存储到 TransactionStore|                           |
+  |                           |    add_txn()              |                           |
+  |                           |    ├─ PriorityIndex: gas 排序                         |
+  |                           |    ├─ ParkingLot: 未就绪  |                           |
+  |                           |    ├─ TimelineIndex: NonQualified ← 不加入广播队列     |
+  |                           |    └─ TTLIndex: 过期管理  |                           |
+  |                           |                           |                           |
+  | 200 OK (hash)             |                           |                           |
+  |<--------------------------|                           |                           |
+  |                           |                           |                           |
+  |                           | 注意: 验证者之间不广播交易！|                           |
+  |                           |                           |                           |
+  |                           | [BatchGenerator 定时触发，每 100ms]                   |
+  |                           | 5. MempoolProxy::pull_internal()                      |
+  |                           |    (quorum_store/utils.rs:110)                        |
+  |                           |    ↓                      |                           |
+  |                           | 6. QuorumStoreRequest::GetBatchRequest               |
+  |                           |    发送到本地 Mempool      |                           |
+  |                           |    ↓                      |                           |
+  |                           | 7. mempool.get_batch()    |                           |
+  |                           |    (core_mempool/mempool.rs:426)                      |
+  |                           |    └─ 最多 5000 笔，5 MB  |                           |
+  |                           |    ↓                      |                           |
+  |                           | 8. 计算批次哈希            |                           |
+  |                           |    digest = hash(txns)    |                           |
+  |                           |    (batch_generator.rs:130)|                           |
+  |                           |    ↓                      |                           |
+  |                           | 9. 保存到本地 BatchStore   |                           |
+  |                           |    batch_store.save(batch_id, txns)                   |
+  |                           |    (batch_store.rs)       |                           |
+  |                           |    ↓                      |                           |
+  |                           | 10. 创建并签名 BatchInfo   |                           |
+  |                           |     SignedBatchInfo (300 bytes)                       |
+  |                           |                           |                           |
+  |                           |--- broadcast SignedBatchInfo (300 bytes) ------------>|
+  |                           |                           | 11. 接收 BatchInfo        |
+  |                           |                           |     (network_listener.rs:18)
+  |                           |                           | 12. 验证签名              |
+  |                           |                           |     ↓                     |
+  |                           |<-- request_batch ---------|                           |
+  |                           | 13. 发送完整交易数据       |                           |
+  |                           |--- BatchResponse (1.5 MB) -->| 14. 验证哈希匹配         |
+  |                           |                           | 15. 保存到本地 BatchStore |
+  |                           |                           | 16. 签名 BatchInfo        |
+  |                           |                           |                           |
+  |                           |<-- SignedBatchInfo (300 bytes) -----------------------|
+  |                           | 17. 收集签名              |                           |
+  |                           |                           |                           |
+  |                           |--- broadcast SignedBatchInfo (300 bytes) ---------------------------->| 18. 接收
+  |                           |                           |                           | 19. 验证签名
+  |                           |<-- request_batch ------------------------------------------| 20. 请求交易
+  |                           |--- BatchResponse (1.5 MB) --------------------------------->| 21. 验证哈希
+  |                           |                           |                           | 22. 保存 BatchStore
+  |                           |                           |                           | 23. 签名 BatchInfo
+  |                           |<-- SignedBatchInfo (300 bytes) --------------------------| 24. 发送签名
+  |                           |                           |                           |
+  |                           | [ProofCoordinator 聚合签名]|                           |
+  |                           | 25. 收集 2f+1 签名（3/4）  |                           |
+  |                           | 26. 聚合 BLS 签名         |                           |
+  |                           |     aggregate([A,B,C])    |                           |
+  |                           |     (proof_coordinator.rs:80)                         |
+  |                           | 27. 创建 ProofOfStore     |                           |
+  |                           |     (BatchInfo + 聚合签名, 500 bytes)                 |
+  |                           |                           |                           |
+  |                           |--- broadcast ProofOfStore (500 bytes) --------------->|
+  |                           |                           | 28. 接收证明              |
+  |                           |                           | 29. 验证聚合签名          |
+  |                           |                           | 30. 插入 ProofQueue       |
+  |                           |                           |                           |
+  |                           |                           |                           |<-- ProofOfStore (500 bytes)
+  |                           |                           |                           | 31. 接收证明
+  |                           |                           |                           | 32. 验证签名
+  |                           |                           |                           | 33. 插入 ProofQueue
+  |                           |                           |                           |
+  |                           | 结果: 所有节点都有 ProofOfStore 和本地 BatchStore 中的完整交易 |
+  |                           |                           |                           |
+  |                           | [验证者 B 成为提议者]      |                           |
+  |                           |                           | 34. on_new_round()        |
+  |                           |                           | 35. generate_proposal()   |
+  |                           |                           |     ↓                     |
+  |                           |                           | 36. QuorumStoreClient::pull_payload()
+  |                           |                           |     (quorum_store_client.rs)
+  |                           |                           |     ↓                     |
+  |                           |                           | 37. proof_manager.get_batch_for_proposal()
+  |                           |                           |     (proof_manager.rs:72) |
+  |                           |                           |     └─ 返回 ProofOfStore  |
+  |                           |                           |     ↓                     |
+  |                           |                           | 38. 构建 BlockData        |
+  |                           |                           |     payload: InQuorumStore([proof])
+  |                           |                           |     大小: 约 5 KB（不是 5 MB！）
+  |                           |                           |     ↓                     |
+  |                           |                           | 39. 签名并广播区块提议      |
+  |                           |                           |                           |
+  |                           |<-- broadcast Proposal (5 KB) -------|                 |
+  |                           | 40. 接收区块提议           |                           |
+  |                           | 41. 从 BatchStore 读取交易 |                           |
+  |                           |     batch_store.get_batch(proof.batch_id)             |
+  |                           |     (本地读取，无网络开销)  |                           |
+  |                           | 42. 执行交易              |                           |
+  |                           | 43. 对执行结果投票         |                           |
+  |                           |                           |                           |<-- Proposal (5 KB)
+  |                           |                           |                           | 44. 接收提议
+  |                           |                           |                           | 45. 从 BatchStore 读取
+  |                           |                           |                           | 46. 执行交易
+  |                           |                           |                           | 47. 投票
+  |                           |                           |                           |
+  |                           | 所有验证者完成执行和投票    |                           |
+```
+
+**Quorum Store 模式特点**：
+- ✅ **网络高效**：区块提议仅传输证明（5 KB vs 5 MB），**节省 99.9% 带宽**
+- ✅ **批量处理**：5000 笔交易一次性处理，减少网络往返
+- ✅ **扩展性强**：验证者数量增加时，网络负载增长缓慢
+- ✅ **签名压缩**：BLS 聚合签名（100 个签名 → 1 个聚合签名）
+- ⚠️ **复杂度高**：需要协调多个组件（BatchGenerator, ProofCoordinator, BatchStore）
+- ⚠️ **存储需求**：每个节点需要 10-50 GB BatchStore 缓存
+
+**网络开销计算**（100 个验证者，1000 TPS）：
+```
+批次传播阶段:
+  - SignedBatchInfo 广播: 300 bytes × 10 批次/秒 × 100 节点 = 300 KB/s
+  - 完整交易按需拉取: 1.5 MB × 10 批次/秒 = 15 MB/s（仅初次）
+  - SignedBatchInfo 返回: 300 bytes × 10 × 100 = 300 KB/s
+  - ProofOfStore 广播: 500 bytes × 10 × 100 = 500 KB/s
+
+区块提议阶段:
+  - 区块大小: 5 KB（不是 5 MB！）
+  - 区块传播: 5 KB × 3 次/秒 × 100 节点 = 1.5 MB/s
+
+总带宽需求: ~16.6 MB/s（相比 Direct 模式的 6.5 GB/s，节省 99.7%！）
+```
+
+---
+
+#### 两种模式关键对比表
+
+| 方面 | Direct Mempool 模式 | Quorum Store 模式 | 优势方 |
+|------|-------------------|------------------|-------|
+| **交易接收** | REST API → Mempool | REST API → Mempool | 相同 |
+| **交易存储** | TransactionStore | TransactionStore | 相同 |
+| **交易传播** | 主动广播到所有验证者（每 50ms） | 不广播，仅保存到本地 Mempool | QS |
+| **传播单位** | 单笔交易（~500 bytes） | 批次元数据（~300 bytes） | QS |
+| **批次大小** | 300 笔/批 | 5000 笔/批 | QS |
+| **网络协议** | DirectSend P2P | 批次广播 + 按需拉取 | QS |
+| **数据重复传输** | 高（N × 交易数） | 低（仅元数据广播） | QS |
+| **区块提议大小** | ~5 MB（完整交易） | ~5 KB（仅 ProofOfStore） | **QS（99.9% 节省）** |
+| **区块广播带宽** | 1.5 GB/s（100 验证者） | 1.5 MB/s（100 验证者） | **QS（1000x 节省）** |
+| **执行前准备** | 直接从区块读取交易 | 从 BatchStore 读取交易 | Direct |
+| **容错机制** | 依赖 ACK 重传 | 依赖 2f+1 签名 + 按需拉取 | QS |
+| **实现复杂度** | 低 | 高 | Direct |
+| **存储需求** | 低（仅 Mempool） | 高（Mempool + BatchStore） | Direct |
+| **适用场景** | 小规模网络（<20 验证者） | 大规模网络（>50 验证者） | 取决于规模 |
+
+---
+
+#### 关键差异总结
+
+**1. 交易传播路径差异**
+
+Direct Mempool 模式:
+```
+客户端 → 验证者 A Mempool
+              ↓ (主动广播)
+         验证者 B Mempool
+              ↓ (主动广播)
+         验证者 C Mempool
+              ↓ (主动广播)
+         验证者 D Mempool
+```
+
+Quorum Store 模式:
+```
+客户端 → 验证者 A Mempool (仅本地存储)
+              ↓ (BatchGenerator 拉取)
+         验证者 A BatchStore
+              ↓ (广播 BatchInfo 元数据)
+         验证者 B/C/D (按需拉取完整交易)
+              ↓
+         验证者 B/C/D BatchStore
+```
+
+**2. 区块提议内容差异**
+
+```
+Direct Mempool 区块:
+BlockData {
+    payload: DirectMempool([
+        SignedTransaction,  // 完整交易 1
+        SignedTransaction,  // 完整交易 2
+        ...                 // 5000 笔交易
+    ])
+}
+大小: ~5 MB
+
+Quorum Store 区块:
+BlockData {
+    payload: InQuorumStore([
+        ProofOfStore {
+            info: BatchInfo,          // 批次元数据（200 bytes）
+            multi_signature: AggSig,  // 聚合签名（96 bytes）
+        },
+        ... // 10 个证明
+    ])
+}
+大小: ~5 KB（仅元数据！）
+```
+
+**3. 网络拓扑差异**
+
+Direct Mempool 模式（网状广播）:
+```
+      A ←→ B
+      ↕ ✕ ↕
+      C ←→ D
+
+每对节点都有双向交易流
+N 个验证者 = N(N-1) 个连接
+网络负载: O(N²)
+```
+
+Quorum Store 模式（星型 + 按需）:
+```
+      A → [BatchInfo] → B/C/D
+      ↑
+      └─ [完整交易] ← B (按需请求)
+
+元数据广播: O(N)
+完整交易: O(1) 按需
+网络负载: O(N)
+```
+
+**4. 时间线对比**
+
+```
+时间 →   Direct Mempool                    Quorum Store
+------   ----------------------------------  ----------------------------------
+0ms      客户端提交交易                      客户端提交交易
+10ms     验证者 A Mempool 存储               验证者 A Mempool 存储
+50ms     A 广播到 B/C/D (5 MB)              (无广播)
+100ms    B/C/D 接收并存储                   BatchGenerator 拉取 5000 笔
+150ms    B 广播到 A/C/D (5 MB)              A 广播 BatchInfo (300 bytes)
+200ms    A/C/D 接收并存储                   B/C 接收 BatchInfo
+250ms    C 广播到 A/B/D (5 MB)              B/C 请求完整交易 (1.5 MB)
+300ms    A/B/D 接收并存储                   B/C 接收交易并存储
+350ms    D 广播到 A/B/C (5 MB)              B/C/D 签名并返回
+400ms    全部同步完成                       ProofCoordinator 聚合签名
+450ms    (持续广播新交易)                   ProofOfStore 生成
+500ms    提议者创建区块 (5 MB)              提议者创建区块 (5 KB)
+550ms    广播区块 (150ms 传输时间)          广播区块 (1ms 传输时间)
+700ms    验证者接收区块并执行                验证者接收区块并从本地 BatchStore 读取
+750ms    投票                               投票
+
+总带宽:  20 MB (交易) + 5 MB (区块) = 25 MB    1.5 MB (交易) + 5 KB (区块) = 1.5 MB
+节省:    -                                    94% 带宽节省
+```
+
+**关键文件路径**:
+- **Direct 模式核心**：`mempool/src/shared_mempool/tasks.rs:57-123` - 广播执行
+- **Direct 模式核心**：`mempool/src/shared_mempool/network.rs:367-597` - 批次选择和发送
+- **QS 模式核心**：`consensus/src/quorum_store/batch_generator.rs:60-166` - 批次生成
+- **QS 模式核心**：`consensus/src/quorum_store/proof_coordinator.rs:38-102` - 签名聚合
+- **模式切换**：`mempool/src/shared_mempool/tasks.rs:762-795` - 链上配置更新
+- **模式判断**：`mempool/src/shared_mempool/tasks.rs:141-147` - 广播资格判断
+
+---
+
 ### 3.1 核心数据结构
 
 **BatchInfo** - 批次元数据
