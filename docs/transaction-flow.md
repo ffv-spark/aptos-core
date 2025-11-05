@@ -420,7 +420,11 @@ network.rs:404-409 - broadcast_proposal()
 
 ## 阶段 5：Move VM 执行交易
 
-> **注意**: 如果区块包含 ProofOfStore，验证者先从本地 BatchStore 获取完整交易，然后执行。
+> **重要**:
+> - **所有验证者都要执行交易**，不仅仅是提议者！
+> - 每个验证者在投票之前推测性执行区块中的所有交易
+> - 验证者对执行结果（状态认证器）进行投票，而不仅仅是交易顺序
+> - 如果区块包含 ProofOfStore，验证者先从本地 BatchStore 获取完整交易
 
 ### 5.1 区块执行入口
 **文件**: `aptos-move/aptos-vm/src/aptos_vm.rs`
@@ -481,12 +485,167 @@ session/mod.rs:139 - execute_loaded_function()
     └─ 执行 Move 字节码
 ```
 
+### 5.6 推测执行和投票机制（重要）
+
+**所有验证者都执行交易的完整流程**：
+
+#### 执行和投票流程
+
+**文件**: `consensus/src/round_manager.rs`
+
+```
+验证者接收区块提议
+    ↓
+round_manager.rs:1344 - process_verified_proposal()
+    ├─ 检查区块合法性
+    └─ 调用 create_vote()
+    ↓
+round_manager.rs:1325 - create_vote()
+    └─ 调用 vote_block()
+    ↓
+round_manager.rs:1462 - vote_block()
+    ├─ 调用 block_store.insert_block()  【关键：这里执行交易】
+    ├─ 检查投票规则（SafetyRules）
+    └─ 创建包含状态认证器的投票
+    ↓
+block_store.rs:413 - insert_block()
+    └─ insert_block_inner()
+    ↓
+block_store.rs:491 - insert_block_inner()
+    └─ pipeline_builder.build_for_consensus()  【构建执行管道】
+        ├─ 推测性执行所有交易
+        ├─ 计算执行后的状态哈希（状态认证器）
+        └─ 不提交到持久化存储（无外部效应）
+    ↓
+验证者对区块和执行结果投票
+    ├─ 投票包含：区块哈希 + 状态认证器
+    └─ 发送给下一轮的领导者
+```
+
+#### 关键概念
+
+**1. 推测执行（Speculative Execution）**
+
+```
+定义：在交易最终提交之前就执行它们
+特点：
+├─ 所有验证者并行执行相同的交易
+├─ 执行结果存储在内存中（不写入磁盘）
+├─ 如果区块未被提交，执行结果被丢弃
+└─ 如果区块被提交，执行结果被持久化
+```
+
+**代码位置**: `consensus/src/block_storage/block_store.rs:491`
+```rust
+pipeline_builder.build_for_consensus(
+    &pipelined_block,
+    parent_block.pipeline_futs()?,
+    callback,
+);  // 构建执行管道，推测性执行交易
+```
+
+**2. 状态认证器（State Authenticator）**
+
+```
+定义：执行后数据库状态的加密哈希
+作用：
+├─ 所有诚实验证者应计算出相同的状态哈希
+├─ 投票时包含状态哈希
+├─ 防止非确定性执行导致的分叉
+└─ 客户端可用 QC 验证读取的状态
+```
+
+**投票包含**:
+- 区块哈希（交易顺序的承诺）
+- 状态认证器（执行结果的承诺）
+- 验证者签名
+
+#### 为什么所有验证者都要执行？
+
+从 `consensus/README.md:23` 的说明：
+
+> "A validator receives the proposed block and checks their voting rules to determine if it should vote for certifying this block. **If the validator intends to vote for this block, it executes the block's transactions speculatively and without external effect.** This results in the computation of an authenticator for the database that results from the execution of the block."
+
+**核心原因**（`consensus/README.md:31`）：
+
+> "We make the protocol more resistant to non-determinism bugs, by having validators collectively sign the resulting state of a block rather than just the sequence of transactions."
+
+**优势对比**：
+
+| 方面 | 传统 BFT（只对交易顺序投票） | Aptos BFT（对执行结果投票） |
+|------|------------------------|----------------------|
+| 非确定性执行 | ❌ 可能导致分叉 | ✅ 提前发现并拒绝 |
+| 状态验证 | ❌ 需要额外机制 | ✅ QC 直接验证状态 |
+| 执行错误 | ❌ 提交后才发现 | ✅ 投票前就发现 |
+| 客户端读取 | ❌ 需要信任单个节点 | ✅ 可用 QC 验证 |
+
+#### 性能影响和优化
+
+**潜在问题**：所有验证者都执行，计算量增加
+
+**Aptos 的优化**：
+
+1. **BlockSTM 并行执行**
+   - 使用多线程并行执行交易
+   - 自动依赖检测和冲突解决
+   - 利用多核 CPU
+
+2. **管道化处理**
+   ```
+   Round N:   执行 → 投票 → 等待 QC
+   Round N+1:       执行 → 投票 → 等待 QC
+   Round N+2:             执行 → 投票 → 等待 QC
+   ```
+   不同区块的阶段可以并行进行
+
+3. **推测执行**
+   - 不等提交，立即执行下一个区块
+   - 减少延迟
+
+4. **高性能硬件**
+   - 验证者通常配备强大的硬件
+   - 多核 CPU、大内存、高速存储
+
+#### 执行失败处理
+
+```
+验证者执行交易失败的情况：
+├─ Gas 不足
+├─ 交易执行错误
+├─ 状态冲突
+└─ VM 错误
+
+处理方式：
+├─ 验证者拒绝投票给该区块
+├─ 该区块无法获得 2f+1 投票
+├─ 无法形成 QC
+└─ 该区块被丢弃，进入下一轮
+```
+
+#### 与其他区块链对比
+
+**以太坊（PoW/PoS）**：
+```
+矿工/提议者：执行交易 → 提议区块
+其他节点：   接收区块 → 验证交易 → 同步状态
+```
+问题：执行和验证是异步的，可能产生分叉
+
+**Aptos（AptosBFT）**：
+```
+所有验证者：并行执行 → 对结果投票 → 形成 QC
+```
+优势：执行结果在投票前就达成共识
+
 **关键文件路径**:
+- `consensus/src/round_manager.rs:1344-1505` - 投票和执行入口
+- `consensus/src/block_storage/block_store.rs:413-517` - 区块插入和执行
 - `aptos-move/aptos-vm/src/aptos_vm.rs:2778-2927` - 单交易执行
 - `aptos-move/aptos-vm/src/aptos_vm.rs:1920-2055` - 用户交易实现
 - `aptos-move/block-executor/src/executor.rs:1669-2610` - 并行执行
 - `aptos-move/aptos-vm/src/block_executor/vm_wrapper.rs:45-114` - 执行器适配器
 - `aptos-move/aptos-vm/src/move_vm_ext/session/mod.rs:108-139` - Session 执行
+- `consensus/README.md:22-31` - 共识协议说明
 
 ---
 
