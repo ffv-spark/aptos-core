@@ -279,12 +279,14 @@ pub fn run_benchmark<V>(
 where
     V: VMBlockExecutor + 'static,
 {
+    println!("create cp");
     create_checkpoint(
         source_dir.as_ref(),
         checkpoint_dir.as_ref(),
         storage_test_config.enable_storage_sharding,
         storage_test_config.enable_indexer_grpc,
     );
+    println!("cp done");
     let (mut config, genesis_key) =
         aptos_genesis::test_utils::test_config_with_custom_features(init_features);
     config.storage.dir = checkpoint_dir.as_ref().to_path_buf();
