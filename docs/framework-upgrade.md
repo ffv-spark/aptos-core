@@ -5,13 +5,17 @@
 ## 目录
 
 - [概述](#概述)
-- [升级流程](#升级流程)
+- [生产环境升级流程](#生产环境升级流程)
   - [1. 编译和准备新框架代码](#1-编译和准备新框架代码)
   - [2. 创建治理提案脚本](#2-创建治理提案脚本)
   - [3. 提交治理提案](#3-提交治理提案)
   - [4. 质押池投票](#4-质押池投票)
   - [5. 执行提案](#5-执行提案)
   - [6. Epoch 切换生效](#6-epoch-切换生效)
+- [开发/测试环境快速部署](#开发测试环境快速部署)
+  - [方式 1：使用 Testnet 脚本（推荐）](#方式-1使用-testnet-脚本推荐)
+  - [方式 2：Genesis 时部署](#方式-2genesis-时部署)
+  - [方式 3：直接使用 code::publish_package_txn](#方式-3直接使用-codepublish_package_txn)
 - [升级策略说明](#升级策略说明)
 - [关键代码文件位置](#关键代码文件位置)
 - [大包支持](#大包支持)
@@ -32,7 +36,9 @@ Aptos Framework 是部署在 `@aptos_framework` (0x1) 地址的核心系统合�
 
 ---
 
-## 升级流程
+## 生产环境升级流程
+
+> **注意**：本节介绍 Mainnet 和公共 Testnet 的完整治理流程。如果您在开发或私有测试环境中工作，请参阅[开发/测试环境快速部署](#开发测试环境快速部署)。
 
 ### 1. 编译和准备新框架代码
 
@@ -696,6 +702,461 @@ aptos move view \
 # 查询 upgrade_number，应该增加了 1
 # 查询 modules 列表，应该包含新模块
 ```
+
+---
+
+## 开发/测试环境快速部署
+
+在开发和测试环境中，完整的治理流程过于繁琐。Aptos 提供了几种快速部署框架更新的方式，绕过治理投票流程，适用于：
+- **本地开发环境**（Localnet）
+- **私有测试网络**（Private Testnet）
+- **开发集群**（Devnet）
+- **单元测试和集成测试**
+
+> ⚠️ **警告**：这些方式仅适用于测试环境！在 Mainnet 和公共 Testnet 上，必须使用完整的治理流程。
+
+---
+
+### 方式 1：使用 Testnet 脚本（推荐）
+
+#### 原理
+
+在测试环境中，存在一个特殊的 **`core_resources`** 账户（地址：`0xA550C18`），该账户在 Genesis 时被授予了 **MintCapability**，可以铸造 APT 代币。通过检测该账户是否拥有 MintCapability，系统判断当前是否为测试环境。
+
+**关键函数**（文件：`aptos-framework/sources/aptos_governance.move:721-727`）：
+
+```move
+/// 仅在 testnet 中调用，core_resources 账户拥有 mint capability
+public fun get_signer_testnet_only(
+    core_resources: &signer,
+    signer_address: address
+): signer acquires GovernanceResponsbility {
+    system_addresses::assert_core_resource(core_resources);
+    // Core resources 账户仅在 tests/testnets 拥有 mint capability
+    assert!(
+        aptos_coin::has_mint_capability(core_resources),
+        error::unauthenticated(EUNAUTHORIZED)
+    );
+    get_signer(signer_address)
+}
+```
+
+**工作流程**：
+1. 验证 `core_resources` 账户拥有 MintCapability（确保是测试环境）
+2. 直接从 `GovernanceResponsbility` 中获取 `@aptos_framework` 的 SignerCapability
+3. 返回具有框架权限的 signer，**无需提案和投票**
+
+#### 步骤 1：编译框架代码
+
+```bash
+cd aptos-move/framework/aptos-framework
+aptos move compile --save-metadata \
+  --named-addresses aptos_framework=0x1
+```
+
+#### 步骤 2：生成 Testnet 脚本
+
+使用 Aptos 框架工具生成专用的 testnet 脚本：
+
+```bash
+cd aptos-move/aptos-release-builder
+
+# 生成 testnet 升级脚本
+cargo run -- generate-proposals \
+  --release-config data/release.yaml \
+  --output-dir /tmp/testnet-upgrade \
+  --testnet
+
+# 这会生成：
+# 0-move-stdlib.move
+# 1-aptos-stdlib.move
+# 2-aptos-framework.move
+# 3-aptos-token.move
+# 4-aptos-token-objects.move
+```
+
+**生成的 testnet 脚本格式**（文件：`aptos-move/framework/src/release_bundle.rs:210-217`）：
+
+```move
+script {
+    use std::vector;
+    use aptos_framework::aptos_governance;
+    use aptos_framework::code;
+
+    // ⚠️ 注意：参数是 core_resources，不是 proposal_id
+    fun main(core_resources: &signer) {
+        // 使用 testnet 专用函数获取 framework_signer
+        let framework_signer = aptos_governance::get_signer_testnet_only(
+            core_resources,
+            @0x1  // @aptos_framework
+        );
+
+        // 准备字节码
+        let code = vector::empty();
+        vector::push_back(&mut code, /* module bytecode */);
+        // ...
+
+        // 发布/升级包
+        code::publish_package_txn(
+            &framework_signer,
+            metadata_serialized,
+            code
+        );
+    }
+}
+```
+
+**与 Mainnet 脚本的对比**：
+
+| 特性 | Testnet 脚本 | Mainnet 脚本 |
+|------|-------------|-------------|
+| 函数签名 | `fun main(core_resources: &signer)` | `fun main(proposal_id: u64)` |
+| 获取 signer | `get_signer_testnet_only(core_resources, @0x1)` | `resolve(proposal_id, @0x1)` |
+| 需要提案 | ❌ 不需要 | ✅ 需要 |
+| 需要投票 | ❌ 不需要 | ✅ 需要（7 天） |
+| 执行者 | core_resources 账户持有者 | 任何人（提案通过后） |
+| 安全检查 | MintCapability 检查 | 提案状态验证 |
+
+#### 步骤 3：执行 Testnet 脚本
+
+使用 `core_resources` 账户的私钥签名并执行脚本：
+
+```bash
+# 方法 1：使用 aptos CLI
+aptos move run-script \
+  --compiled-script-path /tmp/testnet-upgrade/2-aptos-framework.mv \
+  --private-key-file ~/.aptos/core_resources_key \
+  --assume-yes
+
+# 方法 2：使用治理命令（但无需提案）
+aptos governance execute-proposal-fast \
+  --script-path /tmp/testnet-upgrade/2-aptos-framework.move \
+  --core-resources-key ~/.aptos/core_resources_key
+```
+
+#### 步骤 4：触发 Reconfiguration（可选）
+
+如果需要立即生效，手动触发 epoch 切换：
+
+```bash
+# 使用 core_resources 账户
+aptos move run \
+  --function-id 0x1::aptos_governance::force_end_epoch_test_only \
+  --private-key-file ~/.aptos/core_resources_key \
+  --args signer:0x1
+```
+
+**函数实现**（文件：`aptos-framework/sources/aptos_governance.move:707-711`）：
+
+```move
+public entry fun force_end_epoch_test_only(aptos_framework: &signer)
+    acquires GovernanceResponsbility
+{
+    let core_signer = get_signer_testnet_only(aptos_framework, @0x1);
+    system_addresses::assert_aptos_framework(&core_signer);
+    reconfiguration_with_dkg::finish(&core_signer);
+}
+```
+
+#### 优点
+
+- ✅ 最接近生产环境的流程（使用相同的 `code::publish_package_txn()`）
+- ✅ 自动生成脚本，减少人为错误
+- ✅ 兼容性检查仍然生效，确保升级安全
+- ✅ 适用于 Devnet、私有 Testnet、本地测试网络
+
+#### 缺点
+
+- ❌ 需要 `core_resources` 账户的私钥
+- ❌ 仅在 Genesis 时配置了 MintCapability 的网络中可用
+
+---
+
+### 方式 2：Genesis 时部署
+
+#### 原理
+
+在创建新的测试链时，直接在 Genesis 过程中部署框架代码，无需任何升级操作。
+
+#### 适用场景
+
+- 启动全新的本地测试网络
+- 创建私有开发网络
+- 集成测试和端到端测试
+- 快速原型开发
+
+#### 步骤 1：修改 Genesis 配置
+
+编辑 `genesis.blob` 生成配置，指定要部署的框架版本：
+
+```yaml
+# genesis-config.yaml
+chain_id: 4  # Testnet chain ID
+
+# 指定框架版本
+framework:
+  git_hash: "main"  # 或具体的 commit hash
+  bytecode_version: 6
+
+# 验证者配置
+validators:
+  - name: validator-0
+    consensus_pubkey: "..."
+    # ...
+```
+
+#### 步骤 2：生成 Genesis Blob
+
+```bash
+# 使用 aptos-genesis-tool 生成 genesis.blob
+aptos-genesis-tool create-genesis \
+  --output-dir /tmp/genesis \
+  --config-path genesis-config.yaml \
+  --framework-path aptos-move/framework
+
+# 生成的文件：
+# /tmp/genesis/genesis.blob
+# /tmp/genesis/waypoint.txt
+```
+
+**Genesis 过程中的框架部署**（文件：`aptos-framework/sources/genesis.move:68-100`）：
+
+```move
+fun initialize(
+    gas_schedule: vector<u8>,
+    chain_id: u8,
+    initial_version: u64,
+    consensus_config: vector<u8>,
+    // ...
+) {
+    // 1. 创建 @aptos_framework 账户
+    let (aptos_framework_account, aptos_framework_signer_cap) =
+        account::create_framework_reserved_account(@aptos_framework);
+
+    // 2. 初始化账户配置
+    account::initialize(&aptos_framework_account);
+
+    // 3. 将 SignerCapability 交给治理控制
+    aptos_governance::store_signer_cap(
+        &aptos_framework_account,
+        @aptos_framework,
+        aptos_framework_signer_cap
+    );
+
+    // 4. 部署所有框架模块（在 VM genesis 过程中）
+    // ...
+}
+```
+
+#### 步骤 3：启动测试网络
+
+```bash
+# 启动 validator 节点
+aptos-node --config validator-0.yaml \
+  --genesis-blob /tmp/genesis/genesis.blob
+```
+
+#### 优点
+
+- ✅ 最快速的部署方式
+- ✅ 完全控制初始状态
+- ✅ 适合自动化测试和 CI/CD
+- ✅ 无需私钥或治理流程
+
+#### 缺点
+
+- ❌ 仅适用于新链，无法用于已运行的网络
+- ❌ 需要重启所有节点
+- ❌ 所有链上数据会丢失
+
+---
+
+### 方式 3：直接使用 code::publish_package_txn
+
+#### 原理
+
+如果您拥有 `@aptos_framework` 账户的私钥（仅在本地测试环境中），可以直接调用 `code::publish_package_txn()` 发布更新。
+
+#### 适用场景
+
+- **仅限本地单节点测试**（例如：`aptos node run-local-testnet`）
+- 本地开发和调试
+- 单元测试
+
+> ⚠️ **警告**：这种方式在多节点网络中不可用，因为 `@aptos_framework` 的私钥在正常情况下不存在（SignerCapability 被治理控制）。
+
+#### 步骤：使用 Aptos CLI
+
+```bash
+# 前提：您拥有 @aptos_framework 的私钥（仅在本地测试环境）
+
+# 1. 编译框架
+aptos move compile --save-metadata \
+  --package-dir aptos-move/framework/aptos-framework \
+  --named-addresses aptos_framework=0x1
+
+# 2. 发布到链上
+aptos move publish \
+  --package-dir aptos-move/framework/aptos-framework \
+  --named-addresses aptos_framework=0x1 \
+  --private-key-file ~/.aptos/framework_key \
+  --assume-yes
+
+# CLI 会自动：
+# 1. 序列化 PackageMetadata
+# 2. 读取编译后的字节码
+# 3. 调用 code::publish_package_txn()
+```
+
+#### 使用 Move script
+
+如果需要更细粒度的控制，可以编写自定义 script：
+
+```move
+script {
+    use std::vector;
+    use aptos_framework::code;
+
+    fun main(aptos_framework: &signer) {
+        // 准备元数据
+        let metadata = /* BCS 序列化的 PackageMetadata */;
+
+        // 准备字节码
+        let code = vector::empty();
+        vector::push_back(&mut code, /* module1 bytecode */);
+        vector::push_back(&mut code, /* module2 bytecode */);
+
+        // 直接发布
+        code::publish_package_txn(aptos_framework, metadata, code);
+    }
+}
+```
+
+执行：
+
+```bash
+aptos move run-script \
+  --compiled-script-path custom_publish.mv \
+  --private-key-file ~/.aptos/framework_key
+```
+
+#### 优点
+
+- ✅ 最直接的方式
+- ✅ 完全控制发布过程
+- ✅ 适合单元测试和本地开发
+
+#### 缺点
+
+- ❌ 需要 `@aptos_framework` 私钥（生产环境不存在）
+- ❌ 仅适用于本地单节点测试
+- ❌ 多节点网络中无法使用
+
+---
+
+### 快速部署方式对比
+
+| 特性 | 方式 1：Testnet 脚本 | 方式 2：Genesis 部署 | 方式 3：直接发布 |
+|------|---------------------|---------------------|-----------------|
+| **适用环境** | Devnet, 私有 Testnet | 新链启动 | 本地单节点 |
+| **需要私钥** | core_resources 私钥 | 无 | aptos_framework 私钥 |
+| **是否重启** | ❌ 不需要 | ✅ 需要 | ❌ 不需要 |
+| **保留数据** | ✅ 保留 | ❌ 清空 | ✅ 保留 |
+| **兼容性检查** | ✅ 启用 | ✅ 启用 | ✅ 启用 |
+| **多节点支持** | ✅ 支持 | ✅ 支持 | ❌ 仅单节点 |
+| **难度** | 中等 | 简单 | 简单 |
+| **推荐度** | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐ |
+
+---
+
+### 环境区分：如何判断当前环境
+
+判断当前是生产环境还是测试环境的方法：
+
+```bash
+# 查询 core_resources 账户是否有 MintCapability
+aptos move view \
+  --function-id 0x1::aptos_coin::has_mint_capability \
+  --args address:0xA550C18
+
+# 返回：
+# true  -> 测试环境（可以使用快速部署）
+# false -> 生产环境（必须走治理流程）
+# error -> core_resources 账户不存在（生产环境）
+```
+
+或者检查 Chain ID：
+
+```bash
+aptos info
+
+# Chain ID 1 = Mainnet（必须走治理流程）
+# Chain ID 2 = Testnet（公共测试网，通常需要治理流程）
+# Chain ID 4+ = 私有网络（可以使用快速部署）
+```
+
+---
+
+### 常见问题
+
+#### Q1：为什么 Testnet 脚本在 Mainnet 上不能用？
+
+A：`get_signer_testnet_only()` 函数会检查 `core_resources` 账户是否拥有 MintCapability。在 Mainnet 上：
+- `core_resources` 账户不存在，或
+- 该账户没有 MintCapability（在 Genesis 后被销毁）
+
+因此该函数会 abort，脚本执行失败。
+
+#### Q2：如何为本地测试网络配置 core_resources 账户？
+
+A：在 Genesis 配置中添加：
+
+```yaml
+# genesis-config.yaml
+accounts:
+  - address: "0xA550C18"
+    balance: 100000000000000  # 100 万 APT
+    modules:
+      - aptos_framework
+      - aptos_coin
+```
+
+在 Genesis Move 代码中（文件：`aptos-framework/sources/aptos_coin.move:73-89`）：
+
+```move
+public(friend) fun configure_accounts_for_test(
+    aptos_framework: &signer,
+    core_resources: &signer,
+    mint_cap: MintCapability<AptosCoin>,
+) {
+    // 给 core_resources 账户铸造 APT
+    let coins = coin::mint<AptosCoin>(18446744073709551615, &mint_cap);
+    coin::deposit<AptosCoin>(signer::address_of(core_resources), coins);
+
+    // 将 MintCapability 存储到 core_resources 账户
+    move_to(core_resources, MintCapStore { mint_cap });
+}
+```
+
+#### Q3：如何在测试环境中模拟完整的治理流程？
+
+A：即使在测试环境中，您也可以选择走完整的治理流程来测试治理机制本身：
+
+```bash
+# 1. 生成 Mainnet 风格的脚本（不使用 --testnet 标志）
+cargo run -- generate-proposals \
+  --release-config data/release.yaml \
+  --output-dir /tmp/mainnet-style
+
+# 2. 提交提案（需要质押）
+aptos governance propose \
+  --pool-address <STAKE_POOL> \
+  --script-path /tmp/mainnet-style/2-aptos-framework.move
+
+# 3. 投票、执行（与生产环境相同）
+```
+
+这对于测试治理逻辑本身非常有用。
 
 ---
 
