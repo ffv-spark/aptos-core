@@ -1155,7 +1155,183 @@ const expirationTimestampSecs = Math.floor(Date.now() / 1000) + 100;
 // ❌ Prologue 会拒绝：ETRANSACTION_EXPIRATION_TOO_FAR_IN_FUTURE
 ```
 
-#### 7.0.3 垃圾回收触发机制
+#### 7.0.3 什么情况会导致无序交易过期？
+
+**场景 1：Mempool 已满**
+
+无序交易被 Mempool 拒绝或从 Mempool 中驱逐，无法进入区块。
+
+```
+配置：
+- 全局容量：2,000,000 笔交易 或 2 GB 字节
+- 每用户容量：1000 笔无序交易
+
+满载情况：
+1. 全局 Mempool 满：新交易被拒绝（MempoolStatusCode::MempoolIsFull）
+2. 单用户配额满：该用户的新无序交易被拒绝（MempoolStatusCode::TooManyTransactions）
+3. 驱逐机制：当 Mempool 满时，会优先驱逐 ParkingLot 中的交易（序列号交易）
+```
+
+**文件**：`mempool/src/core_mempool/transaction_store.rs:459-461, 336-344`
+
+```rust
+// Mempool 满的判断条件
+fn is_full(&self) -> bool {
+    self.system_ttl_index.size() >= self.capacity ||  // 交易数量达到上限
+    self.size_bytes >= self.capacity_bytes             // 字节大小达到上限
+}
+
+// 每用户无序交易容量检查
+if txns.orderless_txns_len() >= self.orderless_txn_capacity_per_user {
+    return MempoolStatus::new(MempoolStatusCode::TooManyTransactions)
+        .with_message(format!(
+            "Number of orderless transactions from account: {} Capacity: {}",
+            txns.orderless_txns_len(),
+            self.orderless_txn_capacity_per_user,
+        ));
+}
+```
+
+---
+
+**场景 2：Gas 价格设置过低**
+
+无序交易的 Gas 价格太低，在 Mempool 中排序靠后，无法及时被打包。
+
+```
+假设:
+- 交易 A: gas_price = 100, expiration_time = now + 60s
+- 交易 B: gas_price = 1000, expiration_time = now + 60s
+
+结果:
+- 交易 B 优先被打包
+- 交易 A 可能在 60 秒内无法被打包，最终过期
+```
+
+**Gas 价格影响**：
+- Mempool 按 Gas 价格排序（高价优先）
+- Consensus 从 Mempool 获取交易时优先选择高 Gas 价格交易
+- 低 Gas 价格交易可能排队过久而过期
+
+---
+
+**场景 3：网络拥堵**
+
+区块链处理能力不足，TPS 达到上限，导致交易积压。
+
+```
+场景:
+- 链的 TPS: 10,000
+- 提交速率: 15,000 笔/秒
+
+结果:
+- Mempool 积压 5,000 笔/秒
+- 新交易需要等待更长时间才能被处理
+- 60 秒窗口可能不够，交易在被处理前过期
+```
+
+**拥堵原因**：
+- 突发高负载（空投、热门 NFT mint 等）
+- 链的处理能力达到瓶颈
+- Consensus 延迟增加
+
+---
+
+**场景 4：交易验证失败**
+
+交易在 Prologue 验证时失败，被 Mempool 拒绝。
+
+```
+常见失败原因:
+1. Nonce 已存在: PROLOGUE_ENONCE_ALREADY_USED
+2. 过期时间太远: PROLOGUE_ETRANSACTION_EXPIRATION_TOO_FAR_IN_FUTURE
+3. 账户余额不足: PROLOGUE_EACCOUNT_DOES_NOT_HAVE_ENOUGH_BALANCE_FOR_TRANSACTION_FEE
+4. Gas 价格太低: PROLOGUE_EGAS_UNIT_PRICE_BELOW_MIN_BOUND
+```
+
+---
+
+**场景 5：系统 TTL 超时**
+
+即使交易的 `expiration_timestamp_secs` 还未到期，Mempool 也有自己的系统 TTL。
+
+**文件**：`mempool/src/shared_mempool/tasks.rs:666, 742`
+
+```rust
+// Consensus 获取区块前触发 GC
+let curr_time = aptos_infallible::duration_since_epoch();
+mempool.gc_by_expiration_time(curr_time);
+
+// Commit 交易后触发 GC
+if block_timestamp_usecs > 0 {
+    pool.gc_by_expiration_time(block_timestamp);
+}
+```
+
+**GC 逻辑**：
+- 交易在 Mempool 中超过 `expiration_timestamp_secs` 会被删除
+- 即使没有新的无序交易提交，GC 也会在以下时机触发：
+  1. Consensus 请求获取区块时
+  2. 区块提交后处理 committed transactions 时
+
+---
+
+#### 7.0.4 垃圾回收的两个层面
+
+> ⚠️ **重要**：垃圾回收分为两个层面，触发机制不同！
+
+**层面 1：Mempool 垃圾回收（清理 Mempool 中的过期交易）**
+
+**触发时机**：
+
+| 触发场景 | 函数 | 频率 |
+|---------|------|------|
+| Consensus 获取区块 | `gc_by_expiration_time()` | 每次 get_block 时 |
+| 区块提交后 | `gc_by_expiration_time()` | 每次 commit 时 |
+| 定期系统 GC | `gc_by_system_ttl()` | 周期性 |
+
+**文件**：`mempool/src/core_mempool/transaction_store.rs:909-912`
+
+```rust
+/// Garbage collect old transactions based on client-specified expiration time.
+pub(crate) fn gc_by_expiration_time(&mut self, block_time: Duration) {
+    self.gc(self.eager_expire_time(block_time), false);
+}
+```
+
+**清理逻辑**（文件：`transaction_store.rs:914-973`）：
+
+```rust
+fn gc(&mut self, now: Duration, by_system_ttl: bool) {
+    let index = if by_system_ttl {
+        &mut self.system_ttl_index
+    } else {
+        &mut self.expiration_time_index
+    };
+
+    // 获取所有过期交易
+    let mut gc_txns = index.gc(now);
+
+    // 从 Mempool 中删除这些交易
+    for key in gc_txns {
+        if let Some(txns) = self.transactions.get_mut(&key.address) {
+            // 删除序列号交易时，标记后续交易为 non-ready
+            // 无序交易始终 ready，不受影响
+            txns.remove(&key.replay_protector);
+            self.index_remove(&txn);
+        }
+    }
+}
+```
+
+**关键点**：
+- ✅ **会自动触发**：无需新的无序交易，GC 也会在 get_block 和 commit 时执行
+- ✅ **清理所有过期交易**：序列号交易和无序交易都会被清理
+- ✅ **释放 Mempool 空间**：过期交易从内存中删除
+
+---
+
+**层面 2：NonceHistory 垃圾回收（清理链上的 nonce 记录）**
 
 **触发方式：被动增量 GC**
 
@@ -1192,12 +1368,108 @@ while (i < 5 && !bucket.nonces_ordered_by_exp_time.is_empty()) {
 | 特性 | 说明 |
 |------|------|
 | **触发时机** | 每次新无序交易验证时（Prologue 阶段） |
-| **触发条件** | 自动触发，无需手动调用 |
+| **触发条件** | **被动触发**，需要新的无序交易才会触发 |
 | **清理数量** | 每次最多 5 个过期 nonce |
 | **清理范围** | 仅清理当前 bucket（hash(address, nonce) % 50000） |
 | **删除条件** | `expiration_time + 65秒 < current_time` |
+| **⚠️ 重要限制** | **如果没有新的无序交易，过期 nonce 不会被清理** |
 
-#### 7.0.4 重叠窗口（Overlap Interval）
+---
+
+#### 7.0.5 两层 GC 的关键区别
+
+> 🔑 **回答用户的核心问题**：如果没有无序交易发送，过期的 nonce 会被删除吗？
+
+**答案：分两种情况**
+
+| 层面 | 是否会被删除 | 说明 |
+|------|-------------|------|
+| **Mempool 中的无序交易** | ✅ **会被删除** | 即使没有新交易，get_block 和 commit 时会触发 GC |
+| **NonceHistory 中的 nonce** | ❌ **不会被删除** | 需要新的无序交易触发 check_and_insert_nonce() |
+
+**详细解释**：
+
+**情况 1：Mempool 层面**
+
+```
+场景: 一段时间内没有新的无序交易提交
+
+时间 t=0:   Mempool 中有 100 笔无序交易
+时间 t=60:  其中 50 笔交易过期
+
+即使没有新交易提交：
+时间 t=61: Consensus 请求 get_block()
+         → 触发 gc_by_expiration_time()
+         → 删除 50 笔过期交易 ✅
+         → Mempool 中剩余 50 笔交易
+
+结论: Mempool 的 GC 是主动的，与是否有新交易无关
+```
+
+**情况 2：NonceHistory 层面**
+
+```
+场景: 链上 NonceHistory 中有过期 nonce，但没有新的无序交易
+
+时间 t=0:   NonceHistory 中存储 nonce 123 (过期时间 60)
+时间 t=60:  nonce 123 过期
+时间 t=126: nonce 123 可删除时间点 (60 + 65)
+
+如果此时没有新的无序交易：
+时间 t=150: nonce 123 仍然存在于 NonceHistory 中 ❌
+         → 没有触发 check_and_insert_nonce()
+         → GC 不会被触发
+         → nonce 123 继续占用存储空间
+
+如果此时有新的无序交易（即使 nonce 不同）：
+时间 t=150: 新交易 (nonce 456) 到达
+         → 调用 check_and_insert_nonce(sender, 456, exp_time)
+         → 计算 bucket: hash(sender, 456) % 50000 = bucket_X
+         → 清理 bucket_X 中的过期 nonce（最多 5 个）
+         → 如果 nonce 123 也在 bucket_X，会被删除 ✅
+         → 如果 nonce 123 在其他 bucket，不会被删除 ❌
+
+结论: NonceHistory 的 GC 是被动的，依赖新交易触发
+```
+
+**影响分析**：
+
+| 影响方面 | 说明 | 严重性 |
+|---------|------|--------|
+| **存储占用** | 过期 nonce 会持续占用链上存储空间 | 🟡 中等 |
+| **功能影响** | 不影响交易功能，验证逻辑独立于 GC | 🟢 无影响 |
+| **重放攻击** | 不会导致安全问题，验证仍然有效 | 🟢 安全 |
+| **成本** | 链上存储成本增加，但有 50K bucket 分散 | 🟡 中等 |
+
+**未来可能的改进**：
+
+```
+可能的解决方案:
+1. 添加定期 GC 任务（通过链上 cron 或治理提案）
+2. 在 block prologue 时触发部分 GC
+3. 允许任何人调用清理函数（需要 gas 补偿机制）
+```
+
+**当前的实际影响**：
+
+```
+假设场景:
+- 链活跃，每秒 1000 笔无序交易
+- 每笔交易触发 GC 清理 5 个过期 nonce
+- 清理速度: 5000 个/秒
+
+过期 nonce 生成速度:
+- 假设 60 秒窗口，每秒 1000 笔交易
+- 60 秒后开始过期: 1000 个/秒
+
+结论: 清理速度 (5000) >> 过期速度 (1000)
+      → 正常情况下不会积压
+      → 只在链空闲时可能出现 nonce 积累
+```
+
+---
+
+#### 7.0.6 重叠窗口（Overlap Interval）
 
 **常量定义**（文件：`nonce_validation.move:19`）：
 
@@ -1238,7 +1510,7 @@ const NONCE_REPLAY_PROTECTION_OVERLAP_INTERVAL_SECS: u64 = 65;
    重叠窗口缓解了这个问题
    ```
 
-#### 7.0.5 完整时间线示例
+#### 7.0.7 完整时间线示例
 
 **示例场景**：
 
@@ -1294,7 +1566,7 @@ const NONCE_REPLAY_PROTECTION_OVERLAP_INTERVAL_SECS: u64 = 65;
 126s: 可以重用 nonce 123
 ```
 
-#### 7.0.6 GC 性能考虑
+#### 7.0.8 GC 性能考虑
 
 **为什么每次只清理 5 个？**
 
