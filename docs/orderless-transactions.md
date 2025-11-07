@@ -265,6 +265,112 @@ pub fn replay_protector(&self) -> ReplayProtector {
 }
 ```
 
+### 2.5 Nonce 唯一性范围
+
+> ⚠️ **重要**：Nonce 值**不是全局唯一的**，而是**在每个账户地址范围内唯一**。
+
+#### 唯一性键：(address, nonce) 二元组
+
+**文件**：`aptos-framework/sources/nonce_validation.move:72-75`
+
+```move
+struct NonceKey has copy, drop, store {
+    sender_address: address,  // 发送者地址
+    nonce: u64,               // Nonce 值
+}
+```
+
+**唯一性保证**：
+- ✅ **不同地址可以使用相同的 nonce 值**
+  ```
+  地址 0xA 使用 nonce = 123  ← 允许
+  地址 0xB 使用 nonce = 123  ← 允许（不冲突）
+  地址 0xC 使用 nonce = 123  ← 允许（不冲突）
+  ```
+
+- ❌ **同一地址不能重复使用相同的 nonce**（在有效期内）
+  ```
+  地址 0xA 使用 nonce = 123 (过期时间 T1)        ← 允许
+  地址 0xA 再次使用 nonce = 123 (过期时间 T2)   ← 禁止！
+    ↑
+    如果 T2 <= T1 + 65秒（重叠窗口），会被拒绝
+  ```
+
+#### 检查逻辑
+
+**文件**：`nonce_validation.move:138-158`
+
+```move
+// 构造 (address, nonce) 键
+let nonce_key = NonceKey {
+    sender_address,
+    nonce,
+};
+
+// 检查该 (address, nonce) 对是否已存在
+let existing_exp_time = bucket.nonce_to_exp_time_map.get(&nonce_key);
+if (existing_exp_time.is_some()) {
+    let existing_exp_time = existing_exp_time.extract();
+
+    // 如果该 (address, nonce) 对尚未过期，拒绝
+    if (existing_exp_time >= current_time) {
+        return false;  // 重放攻击！
+    };
+
+    // 如果在重叠窗口内，也拒绝
+    if (txn_expiration_time <= existing_exp_time + 65) {
+        return false;  // 过早重用 nonce
+    };
+    // ...
+}
+```
+
+#### 为什么这样设计？
+
+| 设计选择 | 优点 | 如果改成全局唯一 |
+|---------|------|----------------|
+| **每账户独立** | ✅ 不同用户独立生成 nonce，无竞争 | ❌ 需要全局协调，性能瓶颈 |
+| **完整 u64 空间** | ✅ 每个账户有 2^64 个 nonce 可用 | ❌ 全局只有 2^64 个，耗尽后无法使用 |
+| **去中心化** | ✅ 客户端本地生成，无需服务器 | ❌ 需要中心化的 nonce 分配服务 |
+| **并发性** | ✅ 不同账户的交易完全独立 | ❌ 所有交易竞争全局 nonce |
+
+#### 碰撞概率分析
+
+即使在同一个账户内随机生成 nonce，碰撞概率也极低：
+
+**假设**：
+- u64 nonce 空间：2^64 ≈ 1.84 × 10^19
+- 每个账户有 1000 笔未过期的无序交易
+
+**碰撞概率**（生日悖论）：
+```
+P(collision) ≈ n^2 / (2 × 2^64)
+             ≈ 1000^2 / (2 × 1.84 × 10^19)
+             ≈ 2.72 × 10^-14
+             ≈ 0.0000000000272%
+```
+
+**结论**：实际使用中几乎不可能发生同一账户内的 nonce 碰撞！
+
+#### 存储结构证明
+
+**文件**：`nonce_validation.move:49-64`
+
+```move
+// Bucket 中的双 Map 设计
+struct Bucket has store {
+    // Map 1: (过期时间, 地址, nonce) -> bool
+    nonces_ordered_by_exp_time: BigOrderedMap<NonceKeyWithExpTime, bool>,
+
+    // Map 2: (地址, nonce) -> 过期时间
+    //        ^^^^^^^^^^^^^^^^  注意：键是 (地址, nonce) 二元组
+    nonce_to_exp_time_map: BigOrderedMap<NonceKey, u64>,
+}
+```
+
+**注释明确说明**（line 57-58）：
+> An **(address, nonce) pair** is guaranteed to be unique in both the big ordered maps. Two transactions with the **same (address, nonce) pair** cannot be stored at the same time.
+
 ---
 
 ## 3. 链上 Nonce 管理机制
