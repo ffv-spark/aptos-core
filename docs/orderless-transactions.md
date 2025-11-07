@@ -1064,6 +1064,268 @@ parking_lot_index: ParkingLotIndex,
 
 ## 7. 重放攻击防护机制
 
+### 7.0 过期和垃圾回收机制
+
+> **核心问题**：无序交易什么时候过期？过期的 nonce 怎么被删除？
+
+#### 7.0.1 交易过期条件
+
+**过期判断**（文件：`types/src/transaction/mod.rs:198`）：
+
+每个交易都有一个 `expiration_timestamp_secs` 字段（Unix 时间戳，秒）：
+
+```rust
+pub struct RawTransaction {
+    sender: AccountAddress,
+    sequence_number: u64,
+    payload: TransactionPayload,
+    max_gas_amount: u64,
+    gas_unit_price: u64,
+    expiration_timestamp_secs: u64,  // ← 过期时间
+    chain_id: ChainId,
+}
+```
+
+**过期条件**：
+
+```
+交易过期 <=> 当前时间 > expiration_timestamp_secs
+```
+
+**示例**：
+
+```
+交易 A:
+  expiration_timestamp_secs = 1000
+
+时间线:
+  t=999  ← 交易有效，可以执行
+  t=1000 ← 交易有效，刚好在截止时间
+  t=1001 ← 交易过期，无法执行
+```
+
+#### 7.0.2 无序交易的过期时间限制
+
+**文件**：`aptos-framework/sources/transaction_validation.move:24-26`
+
+```move
+// 官方建议: 无序交易最大过期时间 60 秒
+// 加上 5 秒容错（客户端和区块链时钟可能有偏移）
+const MAX_EXPIRATION_TIME_SECONDS_FOR_ORDERLESS_TXNS: u64 = 65;
+```
+
+**Prologue 验证**（文件：`transaction_validation.move:257-261`）：
+
+```move
+fun check_for_replay_protection_orderless_txn(
+    sender: address,
+    nonce: u64,
+    txn_expiration_time: u64,
+) {
+    // 检查过期时间不能太远
+    assert!(
+        txn_expiration_time <= timestamp::now_seconds() + 65,
+        PROLOGUE_ETRANSACTION_EXPIRATION_TOO_FAR_IN_FUTURE
+    );
+
+    // 插入 nonce 到历史记录
+    assert!(
+        nonce_validation::check_and_insert_nonce(sender, nonce, txn_expiration_time),
+        PROLOGUE_ENONCE_ALREADY_USED
+    );
+}
+```
+
+**限制原因**：
+
+| 限制 | 原因 |
+|------|------|
+| **最大 65 秒** | 防止 NonceHistory 占用过多存储空间 |
+| **建议 60 秒** | 给客户端和链时钟偏移留 5 秒容错 |
+| **最小 1 秒** | 必须大于当前时间 |
+
+**过期时间设置示例**：
+
+```typescript
+// 推荐：设置 60 秒后过期
+const expirationTimestampSecs = Math.floor(Date.now() / 1000) + 60;
+
+// 错误：设置过期时间太远（超过 65 秒）
+const expirationTimestampSecs = Math.floor(Date.now() / 1000) + 100;
+// ❌ Prologue 会拒绝：ETRANSACTION_EXPIRATION_TOO_FAR_IN_FUTURE
+```
+
+#### 7.0.3 垃圾回收触发机制
+
+**触发方式：被动增量 GC**
+
+**文件**：`aptos-framework/sources/nonce_validation.move:177-193`
+
+```move
+// 每次调用 check_and_insert_nonce() 时触发 GC
+// 即：每次有新的无序交易执行 Prologue 时
+
+// 最多清理 5 个过期 nonce
+const MAX_ENTRIES_GARBAGE_COLLECTED_PER_CALL: u64 = 5;
+
+// Garbage collect upto 5 expired nonces in the bucket.
+let i = 0;
+while (i < 5 && !bucket.nonces_ordered_by_exp_time.is_empty()) {
+    let (front_k, _) = bucket.nonces_ordered_by_exp_time.borrow_front();
+
+    // 删除条件: expiration_time + 65秒 < current_time
+    if (front_k.txn_expiration_time + 65 < current_time) {
+        bucket.nonces_ordered_by_exp_time.pop_front();
+        bucket.nonce_to_exp_time_map.remove(&NonceKey {
+            sender_address: front_k.sender_address,
+            nonce: front_k.nonce,
+        });
+    } else {
+        break;  // 前面的没过期，后面的更不会过期（按时间排序）
+    };
+    i = i + 1;
+}
+```
+
+**关键点总结**：
+
+| 特性 | 说明 |
+|------|------|
+| **触发时机** | 每次新无序交易验证时（Prologue 阶段） |
+| **触发条件** | 自动触发，无需手动调用 |
+| **清理数量** | 每次最多 5 个过期 nonce |
+| **清理范围** | 仅清理当前 bucket（hash(address, nonce) % 50000） |
+| **删除条件** | `expiration_time + 65秒 < current_time` |
+
+#### 7.0.4 重叠窗口（Overlap Interval）
+
+**常量定义**（文件：`nonce_validation.move:19`）：
+
+```move
+const NONCE_REPLAY_PROTECTION_OVERLAP_INTERVAL_SECS: u64 = 65;
+```
+
+**作用**：
+
+1. **延迟删除**：
+   ```
+   交易过期时间: T
+   实际删除时间: T + 65 秒
+
+   理由：防止时钟偏移导致的重放攻击
+   ```
+
+2. **防止 nonce 重用过早**：
+   ```
+   交易 A: nonce=123, 过期时间=1000
+   交易 B: nonce=123, 过期时间=1030
+
+   拒绝原因：1030 <= 1000 + 65
+            （两笔交易过期时间间隔 < 65 秒）
+   ```
+
+3. **时钟偏移容错**：
+   ```
+   场景：客户端时钟比链快 5 秒
+
+   客户端认为: t=1005
+   链认为:     t=1000
+
+   如果交易在 t=1000 过期：
+   - 客户端发送交易 (认为还没过期)
+   - 链拒绝 (已经过期)
+
+   重叠窗口缓解了这个问题
+   ```
+
+#### 7.0.5 完整时间线示例
+
+**示例场景**：
+
+```
+时间 t=0:
+  提交无序交易 Txn1
+  - nonce = 123
+  - expiration_time = 60
+  - 插入到 NonceHistory
+
+时间 t=30:
+  提交无序交易 Txn2
+  - nonce = 123 (相同 nonce!)
+  - expiration_time = 90
+  - ❌ 被拒绝: 90 <= 60 + 65
+    理由: 违反重叠窗口规则
+
+时间 t=60:
+  Txn1 过期
+  - 但 nonce 123 仍然保留在 NonceHistory 中
+  - 不会被立即删除
+
+时间 t=100:
+  提交无序交易 Txn3
+  - nonce = 456
+  - expiration_time = 160
+  - 触发 GC: 检查 bucket 中是否有可删除的 nonce
+  - 发现 nonce 123: 60 + 65 = 125 < 100? ❌ 不满足
+  - nonce 123 继续保留
+
+时间 t=126:
+  提交无序交易 Txn4
+  - nonce = 789
+  - expiration_time = 186
+  - 触发 GC: 检查 bucket
+  - 发现 nonce 123: 60 + 65 = 125 < 126? ✅ 满足！
+  - 删除 nonce 123 from NonceHistory
+
+时间 t=126:
+  提交无序交易 Txn5
+  - nonce = 123 (重用之前的 nonce)
+  - expiration_time = 186
+  - ✅ 允许: nonce 123 已被删除
+```
+
+**关键时间点**：
+
+```
+0s:   nonce 123 插入
+60s:  交易过期（但 nonce 保留）
+125s: 可删除时间点 (60 + 65)
+126s: 实际删除时间（下次 GC 触发）
+126s: 可以重用 nonce 123
+```
+
+#### 7.0.6 GC 性能考虑
+
+**为什么每次只清理 5 个？**
+
+| 考虑因素 | 说明 |
+|---------|------|
+| **Gas 成本** | 删除操作消耗 gas，限制数量避免单笔交易 gas 过高 |
+| **交易延迟** | GC 在 Prologue 阶段执行，过多清理会增加交易验证延迟 |
+| **渐进清理** | 通过多次交易逐步清理，分摊成本 |
+| **充分性** | 假设每秒 1000 笔无序交易，每笔清理 5 个，每秒清理 5000 个，足够应对正常负载 |
+
+**极端情况处理**：
+
+```
+场景: 突然有大量无序交易过期（例如网络拥堵后恢复）
+
+问题: 可能积累大量过期 nonce
+
+解决:
+1. 增量 GC 会随着新交易到来逐步清理
+2. 过期 nonce 仍然占用存储，但不影响功能
+3. 未来可能添加专门的 GC 治理提案清理
+```
+
+**GC 不会导致的问题**：
+
+- ✅ 不会阻止新 nonce 插入（如果 bucket 未满）
+- ✅ 不会导致重放攻击（验证逻辑独立于 GC）
+- ✅ 不会导致交易失败（GC 是 best-effort）
+
+---
+
 ### 7.1 时间窗口保护
 
 **原理**：
