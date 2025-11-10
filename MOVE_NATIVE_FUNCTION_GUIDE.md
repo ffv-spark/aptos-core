@@ -494,6 +494,447 @@ impl ToOnChainGasSchedule for MoveStdlibGasParameters {
 
 ---
 
+## Gas 版本升级机制
+
+### 概述
+
+Aptos 使用版本化的 gas schedule 系统，允许在不破坏现有功能的情况下升级 gas 参数和计费逻辑。
+
+### Gas Feature Version 定义
+
+#### 版本常量定义
+
+位置：`aptos-move/aptos-gas-schedule/src/ver.rs`
+
+```rust
+/// 最新的 gas feature version
+pub const LATEST_GAS_FEATURE_VERSION: u64 = gas_feature_versions::RELEASE_V1_39;
+
+pub mod gas_feature_versions {
+    pub const RELEASE_V1_8: u64 = 11;
+    pub const RELEASE_V1_18: u64 = 22;
+    pub const RELEASE_V1_24: u64 = 28;
+    pub const RELEASE_V1_39: u64 = 43;
+    // ... 更多版本
+}
+```
+
+#### 版本变更日志
+
+每个版本都有对应的变更记录：
+
+- **V31**: Gas charging for modules used in type tags
+- **V22**:
+  - Gas parameters for enums
+  - Gas parameters for `bcs::serialized_size`
+- **V21**: Fix type to type tag conversion in MoveVM
+- **V20**: Limits for bounding MoveVM type sizes
+- **V18**:
+  - Separate limits for governance scripts
+  - Function info & dispatchable token gas params
+- **V14**:
+  - Gas for type creation
+  - Storage Fee: Make state bytes refundable
+
+### 链上 Gas Schedule 存储
+
+#### 数据结构
+
+位置：`aptos-move/framework/aptos-framework/sources/configs/gas_schedule.move`
+
+```move
+/// Gas schedule entry
+struct GasEntry has store, copy, drop {
+    key: String,    // 参数名，如 "bcs.constant_serialized_size.base"
+    val: u64,       // 参数值，如 735
+}
+
+/// Gas schedule V2 (当前版本)
+struct GasScheduleV2 has key, copy, drop, store {
+    feature_version: u64,           // 版本号
+    entries: vector<GasEntry>,      // 所有 gas 参数
+}
+```
+
+#### 存储位置
+
+Gas schedule 存储在 `@aptos_framework` 账户下：
+
+```move
+// 在 genesis 时初始化
+public(friend) fun initialize(
+    aptos_framework: &signer,
+    gas_schedule_blob: vector<u8>
+) {
+    let gas_schedule: GasScheduleV2 = from_bytes(gas_schedule_blob);
+    move_to<GasScheduleV2>(aptos_framework, gas_schedule);
+}
+```
+
+### Gas 版本升级流程
+
+#### 1. 定义新的 Gas 参数
+
+在 `gas_schedule/move_stdlib.rs` 或其他 gas schedule 文件中添加参数：
+
+```rust
+crate::gas_schedule::macros::define_gas_parameters!(
+    MoveStdlibGasParameters,
+    "move_stdlib",
+    NativeGasParameters => .move_stdlib,
+    [
+        // 现有参数...
+
+        // 新参数 - 从 V1_28 (即 feature version 28) 开始生效
+        [my_new_function_base: InternalGas,
+            { RELEASE_V1_28.. => "mymodule.my_new_function.base" },
+            1000],
+    ]
+);
+```
+
+**版本语法**：
+- `"key"` - 从一开始就存在的参数
+- `{ RELEASE_V1_24.. => "key" }` - 从 V1_24 开始存在
+- `{ RELEASE_V1_18..RELEASE_V1_24 => "old_key", RELEASE_V1_24.. => "new_key" }` - 重命名参数
+
+#### 2. 更新 LATEST_GAS_FEATURE_VERSION
+
+编辑 `aptos-move/aptos-gas-schedule/src/ver.rs`：
+
+```rust
+// 添加新版本常量
+pub mod gas_feature_versions {
+    // ...
+    pub const RELEASE_V1_40: u64 = 44;  // 新版本
+}
+
+// 更新最新版本
+pub const LATEST_GAS_FEATURE_VERSION: u64 = gas_feature_versions::RELEASE_V1_40;
+```
+
+#### 3. 生成 Gas Schedule Blob
+
+使用 `aptos-release-builder` 工具生成升级提案：
+
+```rust
+// aptos-move/aptos-release-builder/src/components/gas.rs
+
+pub fn generate_gas_upgrade_proposal(
+    old_gas_schedule: Option<&GasScheduleV2>,
+    new_gas_schedule: &GasScheduleV2,
+    is_testnet: bool,
+    next_execution_hash: Option<HashValue>,
+    is_multi_step: bool,
+) -> Result<Vec<(String, String)>> {
+    // 1. 计算旧 gas schedule 的哈希
+    let old_hash = if let Some(old) = old_gas_schedule {
+        let old_bytes = bcs::to_bytes(old)?;
+        Some(hex::encode(Sha3_512::digest(old_bytes)))
+    } else {
+        None
+    };
+
+    // 2. 序列化新 gas schedule
+    let gas_schedule_blob = bcs::to_bytes(new_gas_schedule)?;
+
+    // 3. 生成 Move 脚本
+    // 生成类似以下的代码：
+    // gas_schedule::set_for_next_epoch_check_hash(
+    //     &framework_signer,
+    //     x"old_hash...",
+    //     gas_schedule_blob
+    // );
+    // aptos_governance::reconfigure(&framework_signer);
+
+    Ok(result)
+}
+```
+
+生成的提案示例：
+
+```move
+script {
+    use aptos_framework::aptos_governance;
+    use aptos_framework::gas_schedule;
+
+    fun main(proposal_id: u64) {
+        let framework_signer = aptos_governance::resolve_multi_step_proposal(
+            proposal_id,
+            @0x1,
+            x"next_execution_hash..."
+        );
+
+        let gas_schedule_blob: vector<u8> = x"0a1b2c3d...";  // BCS 序列化的数据
+
+        // 使用 hash 检查确保正在升级正确的版本
+        gas_schedule::set_for_next_epoch_check_hash(
+            &framework_signer,
+            x"old_schedule_sha3_512_hash...",
+            gas_schedule_blob
+        );
+
+        // 触发重配置，在下一个 epoch 应用新 gas schedule
+        aptos_governance::reconfigure(&framework_signer);
+    }
+}
+```
+
+#### 4. 链上升级函数
+
+**方法 A：带哈希检查的升级**（推荐）
+
+```move
+/// 设置下一个 epoch 的 gas schedule，需要提供旧 schedule 的哈希
+public fun set_for_next_epoch_check_hash(
+    aptos_framework: &signer,
+    old_gas_schedule_hash: vector<u8>,
+    new_gas_schedule_blob: vector<u8>
+) acquires GasScheduleV2 {
+    // 1. 验证权限
+    system_addresses::assert_aptos_framework(aptos_framework);
+
+    // 2. 反序列化新 schedule
+    let new_gas_schedule: GasScheduleV2 = from_bytes(new_gas_schedule_blob);
+
+    if (exists<GasScheduleV2>(@aptos_framework)) {
+        let cur_gas_schedule = borrow_global<GasScheduleV2>(@aptos_framework);
+
+        // 3. 检查版本号只能递增
+        assert!(
+            new_gas_schedule.feature_version >= cur_gas_schedule.feature_version,
+            error::invalid_argument(EINVALID_GAS_FEATURE_VERSION)
+        );
+
+        // 4. 验证旧 schedule 的哈希（防止并发修改）
+        let cur_gas_schedule_bytes = bcs::to_bytes(cur_gas_schedule);
+        let cur_gas_schedule_hash = aptos_hash::sha3_512(cur_gas_schedule_bytes);
+        assert!(
+            cur_gas_schedule_hash == old_gas_schedule_hash,
+            error::invalid_argument(EINVALID_GAS_SCHEDULE_HASH)
+        );
+    };
+
+    // 5. 将新 schedule 放入 config buffer（不立即生效）
+    config_buffer::upsert(new_gas_schedule);
+}
+```
+
+**方法 B：简单升级**（不推荐，可能有并发问题）
+
+```move
+/// 设置下一个 epoch 的 gas schedule
+public fun set_for_next_epoch(
+    aptos_framework: &signer,
+    gas_schedule_blob: vector<u8>
+) acquires GasScheduleV2 {
+    system_addresses::assert_aptos_framework(aptos_framework);
+    let new_gas_schedule: GasScheduleV2 = from_bytes(gas_schedule_blob);
+
+    // 检查版本号
+    if (exists<GasScheduleV2>(@aptos_framework)) {
+        let cur_gas_schedule = borrow_global<GasScheduleV2>(@aptos_framework);
+        assert!(
+            new_gas_schedule.feature_version >= cur_gas_schedule.feature_version,
+            error::invalid_argument(EINVALID_GAS_FEATURE_VERSION)
+        );
+    };
+
+    // 放入 buffer，等待下一个 epoch
+    config_buffer::upsert(new_gas_schedule);
+}
+```
+
+#### 5. Epoch 切换时应用
+
+```move
+/// 在新 epoch 开始时应用 pending 的 gas schedule
+public(friend) fun on_new_epoch(framework: &signer) acquires GasScheduleV2 {
+    system_addresses::assert_aptos_framework(framework);
+
+    // 检查是否有 pending 的 gas schedule
+    if (config_buffer::does_exist<GasScheduleV2>()) {
+        // 从 buffer 中提取
+        let new_gas_schedule = config_buffer::extract_v2<GasScheduleV2>();
+
+        // 应用到全局状态
+        if (exists<GasScheduleV2>(@aptos_framework)) {
+            *borrow_global_mut<GasScheduleV2>(@aptos_framework) = new_gas_schedule;
+        } else {
+            move_to(framework, new_gas_schedule);
+        }
+    }
+}
+```
+
+### 升级流程图
+
+```
+┌──────────────────────────────────────┐
+│ 1. 开发者在代码中定义新 gas 参数      │
+│    - 添加到 gas_schedule/*.rs        │
+│    - 指定版本 { RELEASE_V1_X.. }     │
+└──────────────┬───────────────────────┘
+               │
+               ▼
+┌──────────────────────────────────────┐
+│ 2. 更新 LATEST_GAS_FEATURE_VERSION   │
+│    - ver.rs                          │
+└──────────────┬───────────────────────┘
+               │
+               ▼
+┌──────────────────────────────────────┐
+│ 3. 使用 release-builder 生成提案      │
+│    - 计算旧 schedule hash            │
+│    - 序列化新 schedule               │
+│    - 生成 Move 升级脚本              │
+└──────────────┬───────────────────────┘
+               │
+               ▼
+┌──────────────────────────────────────┐
+│ 4. 通过治理提交提案                   │
+│    - 创建提案                        │
+│    - 社区投票                        │
+│    - 提案通过                        │
+└──────────────┬───────────────────────┘
+               │
+               ▼
+┌──────────────────────────────────────┐
+│ 5. 执行升级脚本                       │
+│    - 调用 set_for_next_epoch_...     │
+│    - 新 schedule 进入 config_buffer  │
+│    - 调用 reconfigure()              │
+└──────────────┬───────────────────────┘
+               │
+               ▼
+┌──────────────────────────────────────┐
+│ 6. Epoch 切换                        │
+│    - on_new_epoch() 被调用           │
+│    - 从 buffer 提取新 schedule       │
+│    - 更新全局 GasScheduleV2          │
+└──────────────┬───────────────────────┘
+               │
+               ▼
+┌──────────────────────────────────────┐
+│ 7. 新 gas schedule 生效               │
+│    - 所有节点同步新参数               │
+│    - 新交易使用新 gas 计费            │
+└──────────────────────────────────────┘
+```
+
+### 版本兼容性处理
+
+#### Gas 参数读取
+
+```rust
+// 在 FromOnChainGasSchedule trait 实现中
+fn from_on_chain_gas_schedule(
+    gas_schedule: &BTreeMap<String, u64>,
+    feature_version: u64,
+) -> Result<Self, String> {
+    let mut params = Self::zeros();
+
+    // 对于每个参数，根据 feature_version 选择正确的 key
+    if let Some(key) = extract_key_at_version(feature_version) {
+        let name = format!("move_stdlib.{}", key);
+        params.param_name = gas_schedule
+            .get(&name)
+            .cloned()
+            .ok_or_else(|| format!("Missing gas parameter: {}", name))?
+            .into();
+    }
+
+    Ok(params)
+}
+```
+
+**示例**：参数在不同版本的表现
+
+```rust
+// 定义
+[my_param: InternalGas,
+    { RELEASE_V1_18..RELEASE_V1_24 => "old.my_param",
+      RELEASE_V1_24.. => "new.my_param" },
+    1000]
+
+// 版本 22 (V1_18): 查找 "old.my_param"
+// 版本 28 (V1_24): 查找 "new.my_param"
+// 版本 35 (V1_31): 查找 "new.my_param"
+// 版本 10 (早于 V1_18): 不存在此参数，使用默认值 0
+```
+
+### 命令行工具
+
+#### 生成 gas schedule 提案
+
+```bash
+# 使用 aptos-release-builder
+cargo run -p aptos-release-builder -- \
+    --gas-schedule \
+    --output-dir ./proposals
+```
+
+#### 查看当前 gas schedule
+
+```bash
+# 使用 aptos CLI
+aptos move view \
+    --function-id 0x1::gas_schedule::get_gas_schedule \
+    --url https://fullnode.mainnet.aptoslabs.com/v1
+```
+
+### 最佳实践
+
+1. **版本号只增不减**：
+   ```rust
+   assert!(
+       new_version >= old_version,
+       EINVALID_GAS_FEATURE_VERSION
+   );
+   ```
+
+2. **使用哈希检查**：防止并发修改导致的问题
+   ```move
+   set_for_next_epoch_check_hash(&signer, old_hash, new_blob);
+   ```
+
+3. **渐进式升级**：
+   - 先在 devnet/testnet 测试
+   - 观察性能影响
+   - 再升级到 mainnet
+
+4. **向后兼容**：
+   - 旧版本的参数可以保留（值设为 0）
+   - 新参数使用版本门控 `{ RELEASE_V1_X.. => "key" }`
+
+5. **文档化变更**：
+   - 在 `ver.rs` 的 changelog 中记录
+   - 在提案中说明变更原因
+
+### 安全检查
+
+1. **权限检查**：只有 `@aptos_framework` 可以修改
+   ```move
+   system_addresses::assert_aptos_framework(aptos_framework);
+   ```
+
+2. **版本单调性**：版本号必须递增
+   ```move
+   assert!(new_version >= old_version, EINVALID_GAS_FEATURE_VERSION);
+   ```
+
+3. **哈希验证**：确保升级的是预期的版本
+   ```move
+   assert!(cur_hash == old_hash, EINVALID_GAS_SCHEDULE_HASH);
+   ```
+
+4. **非空检查**：gas schedule blob 不能为空
+   ```move
+   assert!(!vector::is_empty(&gas_schedule_blob), EINVALID_GAS_SCHEDULE);
+   ```
+
+---
+
 ## 关键 API 说明
 
 ### SafeNativeContext 方法
