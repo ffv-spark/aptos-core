@@ -1,0 +1,54 @@
+---
+# Aptos 多框架库升级配置
+# 用途：一次性升级 move-stdlib, aptos-stdlib, aptos-framework 并启用新 feature
+remote_endpoint: https://fullnode.testnet.aptoslabs.com
+name: "multi-framework-upgrade-v1.0"
+
+proposals:
+  - name: framework_and_features_upgrade
+    metadata:
+      title: "Multi-step proposal to upgrade framework packages and enable features"
+      description: |
+        This proposal upgrades the following packages:
+        - move-stdlib (0x1)
+        - aptos-stdlib (0x1)
+        - aptos-framework (0x1)
+
+        And enables new features for the network.
+      source_code_url: "https://github.com/aptos-labs/aptos-core"
+      discussion_url: ""
+
+    # 关键：使用 MultiStep 模式进行多步执行
+    execution_mode: MultiStep
+
+    # 升级序列：按顺序执行
+    update_sequence:
+      # 第一步：升级框架包（包含 move-stdlib, aptos-stdlib, aptos-framework）
+      - Framework:
+          bytecode_version: 8  # Move 字节码版本
+          git_hash: ~          # 使用当前代码库的版本
+
+      # 第二步：启用新的 Feature Flags
+      # 注意：这个放在框架升级之后，确保框架已经支持这些 features
+      - FeatureFlag:
+          enabled:
+            # 根据你的需求启用对应的 features
+            # 以下是常见的 features，请根据实际需求调整
+            - code_dependency_check
+            - treat_friend_as_private
+            - sha512_and_ripemd160_natives
+            - aptos_stdlib_chain_id_natives
+            - vm_binary_format_v6
+            - collect_and_distribute_gas_fees
+            - multi_ed25519_pk_validate_v2_natives
+            - blake2b_256_native
+            - resource_groups
+            - multisig_accounts
+            - delegation_pools
+          disabled: []
+
+      # （可选）第三步：更新 Gas Schedule
+      # 如果需要更新 gas，取消下面的注释
+      # - Gas:
+      #     old: ~  # 从链上获取
+      #     new: current  # 使用当前代码的 gas schedule
