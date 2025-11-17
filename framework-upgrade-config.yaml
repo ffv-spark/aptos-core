@@ -30,21 +30,40 @@ proposals:
 
       # 第二步：启用新的 Feature Flags
       # 注意：这个放在框架升级之后，确保框架已经支持这些 features
+      # 完整的 feature flags 列表请查看：FEATURE_FLAGS_REFERENCE.md
       - FeatureFlag:
           enabled:
-            # 根据你的需求启用对应的 features
-            # 以下是常见的 features，请根据实际需求调整
+            # === 基础代码发布功能 ===
             - code_dependency_check
             - treat_friend_as_private
-            - sha512_and_ripemd160_natives
-            - aptos_stdlib_chain_id_natives
-            - vm_binary_format_v6
-            - collect_and_distribute_gas_fees
+
+            # === 密码学原语 ===
+            - sha512_and_ripe_md160_natives
             - multi_ed25519_pk_validate_v2_natives
             - blake2b_256_native
+            - bls12381_structures
+
+            # === Move VM 字节码版本 ===
+            - vm_binary_format_v8
+
+            # === 资源和存储 ===
             - resource_groups
+            - safer_resource_groups
+
+            # === 账户和认证 ===
             - multisig_accounts
             - delegation_pools
+
+            # === 聚合器 ===
+            - aggregator_v2_api
+
+            # === 模块事件 ===
+            - module_event
+
+            # === 其他常用功能 ===
+            - aptos_std_chain_id_natives
+            - cryptography_algebra_natives
+
           disabled: []
 
       # （可选）第三步：更新 Gas Schedule
