@@ -1,0 +1,73 @@
+---
+# Aptos 多框架库升级配置
+# 用途：一次性升级 move-stdlib, aptos-stdlib, aptos-framework 并启用新 feature
+remote_endpoint: https://fullnode.testnet.aptoslabs.com
+name: "multi-framework-upgrade-v1.0"
+
+proposals:
+  - name: framework_and_features_upgrade
+    metadata:
+      title: "Multi-step proposal to upgrade framework packages and enable features"
+      description: |
+        This proposal upgrades the following packages:
+        - move-stdlib (0x1)
+        - aptos-stdlib (0x1)
+        - aptos-framework (0x1)
+
+        And enables new features for the network.
+      source_code_url: "https://github.com/aptos-labs/aptos-core"
+      discussion_url: ""
+
+    # 关键：使用 MultiStep 模式进行多步执行
+    execution_mode: MultiStep
+
+    # 升级序列：按顺序执行
+    update_sequence:
+      # 第一步：升级框架包（包含 move-stdlib, aptos-stdlib, aptos-framework）
+      - Framework:
+          bytecode_version: 8  # Move 字节码版本
+          git_hash: ~          # 使用当前代码库的版本
+
+      # 第二步：启用新的 Feature Flags
+      # 注意：这个放在框架升级之后，确保框架已经支持这些 features
+      # 完整的 feature flags 列表请查看：FEATURE_FLAGS_REFERENCE.md
+      - FeatureFlag:
+          enabled:
+            # === 基础代码发布功能 ===
+            - code_dependency_check
+            - treat_friend_as_private
+
+            # === 密码学原语 ===
+            - sha512_and_ripe_md160_natives
+            - multi_ed25519_pk_validate_v2_natives
+            - blake2b_256_native
+            - bls12381_structures
+
+            # === Move VM 字节码版本 ===
+            - vm_binary_format_v8
+
+            # === 资源和存储 ===
+            - resource_groups
+            - safer_resource_groups
+
+            # === 账户和认证 ===
+            - multisig_accounts
+            - delegation_pools
+
+            # === 聚合器 ===
+            - aggregator_v2_api
+
+            # === 模块事件 ===
+            - module_event
+
+            # === 其他常用功能 ===
+            - aptos_std_chain_id_natives
+            - cryptography_algebra_natives
+
+          disabled: []
+
+      # （可选）第三步：更新 Gas Schedule
+      # 如果需要更新 gas，取消下面的注释
+      # - Gas:
+      #     old: ~  # 从链上获取
+      #     new: current  # 使用当前代码的 gas schedule
